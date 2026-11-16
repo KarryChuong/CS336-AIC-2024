@@ -42,6 +42,14 @@ class SubmitItem(BaseModel):
 
 def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.jsonl', dres_client=None):
     eng = SearchEngine(index_dir, data_dir)
+    dres_eval_name = None
+    if dres_client is not None:
+        # kiem tra ngay luc khoi dong: sai DRES_EVAL / co 2 evaluation ma chua chon -> biet truoc khi nop
+        try:
+            eid, dres_eval_name = dres_client.active_evaluation()
+            print(f'DRES evaluation: "{dres_eval_name}" ({eid})')
+        except Exception as e:
+            print(f'!! DRES: {e}')
     videos = {p.stem: p for p in Path(video_dir).rglob('*.mp4')} if video_dir else {}
     app = FastAPI(title='HCMAI24 search baseline')
 
@@ -56,7 +64,7 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
     @app.get('/api/info')
     def info():
         return {**eng.info, 'device': eng.device, 'n_videos_playable': len(videos), 'gt_file': gt_file,
-                'dres': dres_client is not None}
+                'dres': dres_client is not None, 'dres_eval': dres_eval_name}
 
     @app.get('/api/search')
     def search(q: str, k: int = 100, max_per_video: int = 0):
@@ -161,7 +169,9 @@ if __name__ == '__main__':
     p.add_argument('--dres-url', default=None, help='vd https://dres.ban-to-chuc.vn (hoac bien DRES_URL)')
     p.add_argument('--dres-user', default=None, help='(hoac bien DRES_USER)')
     p.add_argument('--dres-pass', default=None, help='(hoac bien DRES_PASS) -- nen dung bien moi truong')
+    p.add_argument('--dres-eval', default=None,
+                   help='id / vai ky tu dau cua id / ten evaluation khi co nhieu cai cung chay (hoac DRES_EVAL)')
     a = p.parse_args()
-    client = dres.from_env(a.dres_url, a.dres_user, a.dres_pass)
+    client = dres.from_env(a.dres_url, a.dres_user, a.dres_pass, a.dres_eval)
     print(f'DRES: {client.base if client else "chua cau hinh -> nut Nop bi tat"}')
     uvicorn.run(create_app(a.index, a.data, a.videos, a.gt, client), host=a.host, port=a.port)

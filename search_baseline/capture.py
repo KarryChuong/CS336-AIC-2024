@@ -6,7 +6,8 @@ Chi doc (GET), khong nop gi. Dung chung login/session voi dres.py (DRES_URL, DRE
     GET /api/v2/evaluation/{evaluationId}/state              -> taskTemplateId, taskStatus
     GET /api/v2/evaluation/{evaluationId}/template/task/{taskTemplateId}/hint -> sequence[{contentType, content, offset}]
 
-Chay:          python capture.py [--interval 5] [--out runs/tasks]
+Chay:          python capture.py [--interval 5] [--out runs/tasks] [--eval <id/ten>]
+Nhieu evaluation cung chay: dat DRES_EVAL (hoac --eval) = id, vai ky tu dau cua id, hoac ten.
 Tu kiem tra:   python capture.py --selftest
 """
 import argparse
@@ -16,7 +17,7 @@ import os
 import re
 import time
 
-from dres import from_env
+from dres import from_env, select_evaluation
 
 EXT = {'VIDEO': '.mp4', 'IMAGE': '.jpg'}
 
@@ -98,22 +99,24 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--interval', type=float, default=5)
     p.add_argument('--out', default='runs/tasks')
+    p.add_argument('--eval', default=None, help='id / tien to id / ten evaluation (hoac bien DRES_EVAL)')
     p.add_argument('--selftest', action='store_true')
     a = p.parse_args()
     if a.selftest:
         return selftest()
-    d = from_env()
+    d = from_env(evaluation=a.eval)
     if not d:
         raise SystemExit('Thieu DRES_URL / DRES_USER / DRES_PASS')
+    print(f'DRES: {d.base} | evaluation: {d.evaluation or "(cai ACTIVE duy nhat)"}')
     seen = None
+    eid_shown = None
     pending = None  # (eid, templateId, folder) cua task da lay hint, cho het RUNNING de lay dap an
     while True:
         try:
-            evs = get_json(d, '/api/v2/client/evaluation/list')
-            ev = next((e for e in evs if str(e.get('status')).upper() == 'ACTIVE'), None)
-            if not ev:
-                raise RuntimeError('Khong co evaluation nao dang ACTIVE')
-            eid = ev['id']
+            eid, ename = select_evaluation(get_json(d, '/api/v2/client/evaluation/list'), d.evaluation)
+            if eid != eid_shown:
+                print(f'[{time.strftime("%H:%M:%S")}] dang theo doi: "{ename}" ({eid})')
+                eid_shown = eid
             st = get_json(d, f'/api/v2/evaluation/{eid}/state')
             key = st.get('taskId') or st.get('taskTemplateId')
             running = str(st.get('taskStatus')).upper() == 'RUNNING'

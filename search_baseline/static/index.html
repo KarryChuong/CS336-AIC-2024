@@ -131,12 +131,13 @@ main { padding: 12px 16px 40px; }
       <button class="btn primary" id="dSim">Tìm cảnh tương tự</button>
       <button class="btn" id="dGt">Lưu làm GT cho câu truy vấn</button>
       <button class="btn" id="dCopy">Copy video,frame</button>
-      <button class="btn" id="dSubmit" disabled>Nộp lên DRES</button>
+      <button class="btn" id="dSubmit" disabled title="Nộp video + thời điểm của keyframe này (tkis/vkis)">Nộp KIS (video + thời điểm)</button>
       <span id="dVerdict" style="font-weight:700;align-self:center"></span>
     </div>
     <div class="row">
-      <input type="text" id="dAnswer" placeholder="qakis: sửa &lt;đáp án&gt; rồi Nộp — để trống thì nộp dạng video+thời điểm">
-      <button class="btn" id="dQaReset" title="Điền lại mẫu theo keyframe đang xem">↺</button>
+      <input type="text" id="dAnswer" placeholder="Chỉ cho qakis: bấm ↺ điền mẫu, sửa &lt;đáp án&gt;, rồi bấm Nộp đáp án QA">
+      <button class="btn" id="dQaReset" title="Điền mẫu theo keyframe đang xem">↺</button>
+      <button class="btn" id="dSubmitQa" disabled title="Chỉ dùng cho qakis: gửi chuỗi trong ô bên trái">Nộp đáp án QA</button>
     </div>
     <div>
       <div class="muted" style="font-size:12px;margin-bottom:4px">Keyframe lân cận trong cùng video</div>
@@ -167,8 +168,8 @@ fetch('/api/info').then(r => r.json()).then(j => {
   info = j;
   $('info').textContent = `${j.n_keyframes.toLocaleString()} keyframe · ${j.n_videos} video · ${j.model} (${j.pretrained}) · ${j.device}`
     + (j.n_videos_playable ? ` · xem được ${j.n_videos_playable} video` : '')
-    + (j.dres ? ' · DRES đã nối' : '');
-  $('dSubmit').disabled = !j.dres;
+    + (j.dres ? ` · DRES đã nối${j.dres_eval ? ` → "${j.dres_eval}"` : ' (chưa xác định evaluation!)'}` : '');
+  $('dSubmit').disabled = $('dSubmitQa').disabled = !j.dres;
   $('dSubmit').title = j.dres ? 'Nộp keyframe này lên DRES' : 'Chạy app với --dres-url/--dres-user/--dres-pass';
 });
 
@@ -318,28 +319,35 @@ async function openDrawer(i, item) {
   // 'QA-', nen de nguoi dung sua truc tiep chuoi se gui thay vi doan.
   const qaTemplate = () => `<đáp án>-${r.video}-${Math.round(r.pts_time * 1000)}`;
   $('dQaReset').onclick = () => { $('dAnswer').value = qaTemplate(); $('dAnswer').focus(); };
-  if (!$('dAnswer').value.trim()) $('dAnswer').value = qaTemplate();
+  // KHONG tu dien mau vao o nua: o con chu thi nut nop cu gui dang text -> task KIS bi DRES tu choi
+  // ("non-temporal information"). Gio 2 nut rieng: KIS luon gui video+thoi diem, QA moi gui chu.
 
-  $('dSubmit').onclick = async () => {
-    const text = $('dAnswer').value.trim();
-    const isQa = text && !text.startsWith('<đáp án>');
-    if (text && !isQa) return toast('Chưa điền đáp án vào ô qakis (hoặc xoá trắng ô đó để nộp video)');
-    const what = isQa ? `đáp án "${text}"` : `${r.video} @ frame ${r.frame_idx} (${fmtTime(r.pts_time)})`;
+  async function submit(text) {
+    const what = text ? `đáp án "${text}"` : `${r.video} @ frame ${r.frame_idx} (${fmtTime(r.pts_time)})`;
     if (!confirm(`Nộp lên DRES: ${what}?\nKhông thể hoàn tác.`)) return;
-    $('dSubmit').disabled = true;
+    $('dSubmit').disabled = $('dSubmitQa').disabled = true;
     setVerdict('⏳ đang nộp…', 'var(--muted)');
     try {
       const j = await api('/api/submit', {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(isQa ? {kf_id: r.id, text} : {kf_id: r.id})});
-      // DRES: CORRECT | WRONG | INDETERMINATE | UNDECIDABLE; 202 = da nhan, cham sau
-      const v = j.submission || (j.http === 202 ? 'INDETERMINATE' : (j.status ? 'CORRECT' : 'WRONG'));
+        body: JSON.stringify(text ? {kf_id: r.id, text} : {kf_id: r.id})});
+      // DRES: CORRECT | WRONG | INDETERMINATE | UNDECIDABLE; 202 = da nhan, cham sau.
+      // Khong ok + khong co ket qua cham = bi tu choi truoc khi cham (sai loai bai, het gio...), khong phai SAI
+      const v = j.submission || (j.http === 202 ? 'INDETERMINATE' : (!j.ok ? 'REJECTED' : (j.status ? 'CORRECT' : 'WRONG')));
       const look = {CORRECT: ['✅ ĐÚNG', '#16a34a'], WRONG: ['❌ SAI', '#dc2626'],
-                    INDETERMINATE: ['⏳ CHƯA CHẤM', '#ca8a04'], UNDECIDABLE: ['⚠️ KHÔNG CHẤM ĐƯỢC', '#ca8a04']};
+                    INDETERMINATE: ['⏳ CHƯA CHẤM', '#ca8a04'], UNDECIDABLE: ['⚠️ KHÔNG CHẤM ĐƯỢC', '#ca8a04'],
+                    REJECTED: [`⚠️ BỊ TỪ CHỐI (HTTP ${j.http})`, '#ca8a04']};
       const [txt, col] = look[v] || [`${v}`, '#ca8a04'];
-      setVerdict(`${txt} — ${isQa ? text : r.video + ' @ ' + r.frame_idx}`
+      setVerdict(`${txt} — ${text || r.video + ' @ ' + r.frame_idx}`
         + `${j.description ? ' · ' + j.description : ''}`, col);
     } catch (e) { setVerdict('❌ Lỗi nộp: ' + e.message, '#dc2626'); }
-    $('dSubmit').disabled = !info.dres;
+    $('dSubmit').disabled = $('dSubmitQa').disabled = !info.dres;
+  }
+  $('dSubmit').onclick = () => submit(null);
+  $('dSubmitQa').onclick = () => {
+    const text = $('dAnswer').value.trim();
+    if (!text || text.startsWith('<đáp án>')) return toast('Chưa điền đáp án: bấm ↺ rồi thay <đáp án>');
+    if (/^L\d+_V\d+-\d+$/i.test(text)) return toast('Chuỗi chỉ có video-thời điểm, thiếu đáp án. Task KIS thì bấm nút Nộp KIS');
+    submit(text);
   };
   const v = $('dVideo');
   if (info.n_videos_playable) {
