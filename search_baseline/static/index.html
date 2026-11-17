@@ -104,6 +104,8 @@ main { padding: 12px 16px 40px; }
   <div class="row">
     <input type="text" id="ocr" placeholder='Lọc chữ trên màn hình (OCR), gõ không dấu cũng được: hidro bru · "kim long" · nhiều điều kiện cách nhau bằng ;'>
     <label class="small">Model <select id="enc"><option value="">tất cả (gộp)</option></select></label>
+    <label class="small" title="Cộng điểm khớp nghĩa giữa câu tìm và dòng tít trên bản tin (đọc bằng OCR)" hidden>
+      <input type="checkbox" id="capUse" checked> Dùng tít</label>
     <label class="small" title="VKIS: căn các khung của clip theo đúng thứ tự thời gian trong video (tắt = lấy MAX như cũ)">
       <input type="checkbox" id="align" checked> Căn thời gian (vkis)</label>
     <button class="btn" id="fbGo" disabled title="Tìm lại theo các ảnh đã đánh dấu ✓ (đúng) / ✗ (sai) — Rocchio">Tìm lại theo ✓✗</button>
@@ -176,7 +178,8 @@ function setVerdict(msg, color) {
   }
 }
 // tham so chung cho moi kieu tim: loc OCR + chon model
-const extra = () => `&ocr=${encodeURIComponent($('ocr').value.trim())}&enc=${encodeURIComponent($('enc').value)}`;
+const extra = () => `&ocr=${encodeURIComponent($('ocr').value.trim())}&enc=${encodeURIComponent($('enc').value)}`
+  + ($('capUse').checked ? '' : '&cap=0');
 const esc = s => String(s).replace(/[&<>"]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[ch]));
 const fb = {pos: new Set(), neg: new Set()};   // danh dau dung/sai cho Rocchio, giu qua cac lan tim
 function fbUpdate() {
@@ -200,6 +203,10 @@ fetch('/api/info').then(r => r.json()).then(j => {
   $('enc').parentElement.hidden = (j.encoders || []).length < 2;
   if (!j.ocr_keyframes) { $('ocr').disabled = true; $('ocr').placeholder = 'Chưa có OCR (đặt <data>/ocr/<vid>.jsonl rồi chạy lại app)'; }
   else $('info').textContent += ` · OCR ${j.ocr_keyframes.toLocaleString()} keyframe`;
+  if (j.caption_keyframes) {
+    $('capUse').parentElement.hidden = false;
+    $('info').textContent += ` · tít ${j.caption_keyframes.toLocaleString()} keyframe`;
+  }
   $('dSubmit').title = j.dres ? 'Nộp keyframe này lên DRES' : 'Chạy app với --dres-url/--dres-user/--dres-pass';
 });
 
@@ -357,6 +364,7 @@ async function openDrawer(i, item) {
   $('dKv').innerHTML = `<span>video</span><span>${r.video}</span><span>frame_idx</span><span>${r.frame_idx}</span>`
     + `<span>thời điểm</span><span>${fmtTime(r.pts_time)} (${r.pts_time}s)</span>`
     + (r.score != null ? `<span>score</span><span>${r.score}</span>` : '')
+    + (r.tit ? `<span>tít</span><span>${esc(r.tit)}</span>` : '')
     + (r.ocr ? `<span>OCR</span><span>${esc(r.ocr)}</span>` : '')
     + (r.chain ? `<span>chuỗi</span><span>${r.chain.map((e, n) => `${'ABCDE'[n]} ${fmtTime(e.pts_time)} (f ${e.frame_idx})`).join(' → ')}</span>` : '');
   $('dSim').onclick = () => { closeDrawer(); run(`/api/similar/${r.id}?k=${$('k').value}&max_per_video=${$('mpv').value}${extra()}`, `Tương tự ${r.video} @ ${fmtTime(r.pts_time)}`); };

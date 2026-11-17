@@ -6,6 +6,7 @@
 
 --index: 1 hoac nhieu thu muc index (moi encoder 1 cai, cai DAU la chinh). --weights: trong so tung cai.
 --ocr: thu muc chua <vid>.jsonl OCR (mac dinh tu tim <data>/ocr/).
+--caption: index dong tit (build_caption_index.py) -> cong diem khop nghia; --caption-weight trong so.
 
 --videos (tuy chon): thu muc chua .mp4 (tim de quy) de xem lai doan video quanh keyframe.
 --gt: file jsonl luu cac cap (cau truy van, dap an) bam "Luu lam GT" tren UI -> dung cho evaluate.py.
@@ -55,8 +56,9 @@ class SubmitItem(BaseModel):
 
 
 def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.jsonl', dres_client=None,
-               weights=None, ocr_dirs=None, engine=None):
-    eng = engine or SearchEngine(index_dir, data_dir, weights=weights, ocr_dirs=ocr_dirs)
+               weights=None, ocr_dirs=None, engine=None, caption_dir=None, caption_weight=0.5):
+    eng = engine or SearchEngine(index_dir, data_dir, weights=weights, ocr_dirs=ocr_dirs,
+                                 caption_dir=caption_dir, caption_weight=caption_weight)
     dres_eval_name = None
     if dres_client is not None:
         # kiem tra ngay luc khoi dong: sai DRES_EVAL / co 2 evaluation ma chua chon -> biet truoc khi nop
@@ -81,6 +83,13 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
             raise HTTPException(400, str(e))
         return {'results': res, 'ms': round((time.time() - t) * 1000, 1), **extra}
 
+    def _cap(v):
+        """'' -> trong so mac dinh; '0' -> tat nhanh tit."""
+        try:
+            return float(v) if str(v).strip() != '' else None
+        except ValueError:
+            raise HTTPException(400, f'cap phai la so: {v!r}')
+
     @app.get('/')
     def index():
         return FileResponse(STATIC / 'index.html')
@@ -91,15 +100,15 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
                 'dres': dres_client is not None, 'dres_eval': dres_eval_name}
 
     @app.get('/api/search')
-    def search(q: str = '', k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = ''):
+    def search(q: str = '', k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = '', cap: str = ''):
         """q rong + ocr -> chi loc theo chu tren man hinh."""
-        return _timed(lambda: eng.search(q, k, max_per_video or None, ocr=ocr, use=enc))
+        return _timed(lambda: eng.search(q, k, max_per_video or None, ocr=ocr, use=enc, cap=_cap(cap)))
 
     @app.get('/api/temporal')
     def temporal(a: str, b: str = '', c: str = '', window: float = 30.0,
-                 k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = ''):
+                 k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = '', cap: str = ''):
         return _timed(lambda: eng.temporal([a, b, c], window, k, max_per_video=max_per_video or None,
-                                           ocr=ocr, use=enc))
+                                           ocr=ocr, use=enc, cap=_cap(cap)))
 
     @app.post('/api/search_image')
     async def search_image(request: Request, k: int = 100, max_per_video: int = 0, frames_n: int = 0,
@@ -198,6 +207,8 @@ if __name__ == '__main__':
                    help='thu muc index (build_index.py); nhieu cai = nhieu encoder, cai dau la chinh')
     p.add_argument('--weights', type=float, nargs='*', default=None, help='trong so tung --index, vd 1 0.5')
     p.add_argument('--ocr', nargs='*', default=None, help='thu muc <vid>.jsonl OCR (mac dinh <data>/ocr/)')
+    p.add_argument('--caption', default=None, help='thu muc index dong tit (build_caption_index.py)')
+    p.add_argument('--caption-weight', type=float, default=0.5, help='trong so diem dong tit')
     p.add_argument('--data', default=None, help='OUT_DIR chua keyframes/*.tar (mac dinh lay tu info.json)')
     p.add_argument('--videos', default=None, help='thu muc .mp4 de xem lai video (tuy chon)')
     p.add_argument('--gt', default='queries/gt_ui.jsonl', help='file luu GT khi bam "Luu lam GT"')
@@ -211,4 +222,5 @@ if __name__ == '__main__':
     a = p.parse_args()
     client = dres.from_env(a.dres_url, a.dres_user, a.dres_pass, a.dres_eval)
     print(f'DRES: {client.base if client else "chua cau hinh -> nut Nop bi tat"}')
-    uvicorn.run(create_app(a.index, a.data, a.videos, a.gt, client, a.weights, a.ocr), host=a.host, port=a.port)
+    uvicorn.run(create_app(a.index, a.data, a.videos, a.gt, client, a.weights, a.ocr,
+                           caption_dir=a.caption, caption_weight=a.caption_weight), host=a.host, port=a.port)

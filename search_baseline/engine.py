@@ -8,6 +8,7 @@ list vao SearchEngine. Thu muc DAU la chinh (meta, anh). Cac index khac duoc can
 tung encoder (diem tho moi model mot thang khac nhau). Chi 1 encoder -> giu diem cosine tho nhu cu.
 
 OCR (tuy chon): <data>/ocr/<vid>.jsonl, moi dong {"frame_idx": ..., "text": ...} -> loc ket qua theo cum chu.
+Dong tit (tuy chon): index tu build_caption_index.py -> cong diem khop NGHIA giua cau hoi va dong tit.
 """
 import glob
 import json
@@ -96,6 +97,40 @@ def chain_rep(ev, tkey):
     j = int(np.searchsorted(tkey, mid))
     cands = [c for c in (j - 1, j) if lo <= c <= hi]
     return min(cands, key=lambda c: abs(tkey[c] - mid)) if cands else lo
+
+
+def range_max(vals, lo, hi):
+    """max(vals[lo[i]:hi[i]]) cho moi i (hi > lo), vector hoa bang sparse table O(N log N)."""
+    st = [np.asarray(vals, dtype=np.float64)]       # st[j][i] = max vals[i : i + 2^j]
+    need, step = max(int((hi - lo).max()), 1), 1
+    while step * 2 <= need:
+        prev = st[-1]
+        st.append(np.maximum(prev[:-step], prev[step:]))
+        step *= 2
+    length = hi - lo
+    k = np.floor(np.log2(np.maximum(length, 1))).astype(int)
+    out = np.empty(len(lo))
+    for lv in np.unique(k):
+        m = k == lv
+        span = 1 << lv
+        out[m] = np.maximum(st[lv][lo[m]], st[lv][hi[m] - span])
+    return out
+
+
+def window_max_center(vals, tkey, window_s):
+    """max vals trong [t - w, t + w] cung video (video cach nhau 1e6 giay trong tkey)."""
+    lo = np.searchsorted(tkey, tkey - window_s, side='left')
+    hi = np.searchsorted(tkey, tkey + window_s, side='right')
+    return range_max(vals, lo, hi)
+
+
+def zscore_finite(s):
+    """z-score tren cac gia tri huu han; -inf/nan giu -inf (vd keyframe bi loai)."""
+    z = np.full(len(s), -np.inf)
+    f = np.isfinite(s)
+    if f.any():
+        z[f] = (s[f] - s[f].mean()) / (s[f].std() + 1e-6)
+    return z
 
 
 def dilate_mask(mask, tkey, window_s):
@@ -215,7 +250,8 @@ def zscore(s, missing=None, axis=0):
 
 
 class SearchEngine:
-    def __init__(self, index_dir, data_dir=None, device=None, weights=None, ocr_dirs=None, load_model=True):
+    def __init__(self, index_dir, data_dir=None, device=None, weights=None, ocr_dirs=None, load_model=True,
+                 caption_dir=None, caption_weight=0.5, caption_window=15.0):
         dirs = [index_dir] if isinstance(index_dir, str) else list(index_dir)
         with open(os.path.join(dirs[0], 'info.json'), encoding='utf-8') as f:
             info0 = json.load(f)
@@ -247,6 +283,10 @@ class SearchEngine:
                      'encoders': names, 'weights': self.weights}
         self.ocr_raw = self.ocr_norm = None
         self._load_ocr(ocr_dirs)
+        self.cap = None
+        self.caption_weight, self.caption_window = caption_weight, caption_window
+        if caption_dir:
+            self._load_caption(caption_dir)
 
     # ------------------------------------------------------------------ OCR
     def _load_ocr(self, ocr_dirs=None):
@@ -280,6 +320,61 @@ class SearchEngine:
         print(f'OCR: {len(files)} file, {n_line:,} dong, {self.info["ocr_keyframes"]:,} keyframe co chu'
               + (f', {n_miss:,} dong khong khop keyframe nao' if n_miss else ''))
 
+    # ------------------------------------------------------------------ dong tit (theo nghia)
+    def _load_caption(self, caption_dir):
+        with open(os.path.join(caption_dir, 'info.json'), encoding='utf-8') as f:
+            info = json.load(f)
+        keys = pd.read_csv(os.path.join(caption_dir, 'keys.csv'))
+        pos = pd.Series(np.arange(len(self.meta)), index=pd.MultiIndex.from_arrays([self.video, self.frame_idx]))
+        at = pos.reindex(pd.MultiIndex.from_frame(keys[['video', 'frame_idx']])).to_numpy()
+        ok = ~np.isnan(at)
+        cap_of = np.full(len(self.meta), -1, dtype=np.int64)
+        cap_of[at[ok].astype(np.int64)] = keys['cap_id'].to_numpy()[ok]
+        emb = np.load(os.path.join(caption_dir, 'emb.npy'))
+        with open(os.path.join(caption_dir, 'captions.json'), encoding='utf-8') as f:
+            texts = json.load(f)
+        dtype = torch.float16 if self.device == 'cuda' else torch.float32
+        self.cap = {'info': info, 'cap_of': cap_of, 'texts': texts, 'enc': None, 'cache': {},
+                    'emb': torch.from_numpy(emb).to(self.device, dtype), 'lock': threading.Lock()}
+        self.info['caption_keyframes'] = int((cap_of >= 0).sum())
+        self.info['caption_model'] = info['model']
+        print(f'Tit: {len(texts):,} chuoi, {self.info["caption_keyframes"]:,} keyframe co tit ({info["model"]})'
+              + (f', {int((~ok).sum()):,} khoa khong khop index' if (~ok).any() else ''))
+
+    def _caption_query_vec(self, text):
+        c = self.cap
+        if text not in c['cache']:
+            with c['lock']:
+                if c['enc'] is None:
+                    from build_caption_index import TextEncoder
+                    c['enc'] = TextEncoder(c['info']['model'], self.device, c['info'].get('pooling'))
+                v = c['enc'].encode([text], is_query=True)[0]
+            if len(c['cache']) > 4096:
+                c['cache'].clear()
+            c['cache'][text] = torch.as_tensor(v, dtype=c['emb'].dtype, device=c['emb'].device)
+        return c['cache'][text]
+
+    def caption_scores(self, text):
+        """z-score khop nghia voi dong tit, lan +- caption_window giay (tit chi hien vai giay dau moi tin).
+        Keyframe khong co tit nao gan, hoac tit kem hon trung binh -> 0 (trung tinh)."""
+        c = self.cap
+        per_cap = (c['emb'] @ self._caption_query_vec(text.strip())).float().cpu().numpy()
+        s = np.full(len(self.meta), -np.inf)
+        has = c['cap_of'] >= 0
+        s[has] = per_cap[c['cap_of'][has]]
+        if self.caption_window > 0:
+            s = window_max_center(s, self.tkey, self.caption_window)
+        z = zscore_finite(s)
+        z[~np.isfinite(z)] = 0.0
+        # chi CONG diem khi tit khop hon trung binh; tit khong lien quan khong bi tru diem
+        # (neu tru, video it tit nhu the thao se duoc loi vo ly)
+        return np.maximum(z, 0.0)
+
+    def caption_of(self, i):
+        if self.cap is None or self.cap['cap_of'][i] < 0:
+            return ''
+        return self.cap['texts'][self.cap['cap_of'][i]]
+
     def ocr_filter(self, query, window_s=0.0):
         if self.ocr_norm is None:
             raise ValueError('Chua co OCR: dat <data>/ocr/<vid>.jsonl hoac chay app voi --ocr')
@@ -306,9 +401,17 @@ class SearchEngine:
         tot = sum(wi * zscore(s, self.encoders[i].missing) for wi, s, i in zip(w, per_enc, act))
         return tot / sum(w)
 
-    def text_scores(self, text, use=None):
+    def text_scores(self, text, use=None, cap=None):
+        """Diem hinh anh (gop cac encoder); co index tit thi cong them cap * diem tit (z-score).
+        cap=None -> self.caption_weight; cap=0 -> tat nhanh tit."""
         act = self._active(use)
-        return self._fuse([self.encoders[i].text_scores(text.strip()) for i in act], act)
+        vis = self._fuse([self.encoders[i].text_scores(text.strip()) for i in act], act)
+        w = self.caption_weight if cap is None else cap
+        if self.cap is None or not w:
+            return vis
+        if len(act) == 1:                 # 1 encoder -> diem tho, doi sang z-score de cong duoc
+            vis = zscore_finite(vis)
+        return vis + w * self.caption_scores(text)
 
     def id_scores(self, kf_id, use=None):
         act = self._active(use)
@@ -356,13 +459,15 @@ class SearchEngine:
             r['score'] = round(score, 4)
         if self.ocr_raw is not None and self.ocr_raw.iat[i]:
             r['ocr'] = self.ocr_raw.iat[i][:300]
+        if self.cap is not None and self.cap['cap_of'][i] >= 0:
+            r['tit'] = self.caption_of(i)[:300]
         r.update(kw)
         return r
 
-    def search(self, text, k=100, max_per_video=None, ocr=None, use=None, ocr_window=3.0):
+    def search(self, text, k=100, max_per_video=None, ocr=None, use=None, ocr_window=3.0, cap=None):
         """Van ban; ocr (tuy chon) loc keyframe co chu do trong +-ocr_window giay. Bo trong text -> chi OCR."""
         if text and text.strip():
-            scores = self.text_scores(text, use)
+            scores = self.text_scores(text, use, cap)
         elif ocr and ocr.strip():
             # chi loc OCR: dung keyframe co chu (khong noi cua so), xep theo thu tu video/thoi gian
             scores, ocr_window = 1.0 - np.arange(len(self.meta)) / len(self.meta), 0.0
@@ -452,7 +557,7 @@ class SearchEngine:
         return self._rank(self._apply_ocr(self.clip_scores(S, times, tol), ocr, 3.0), k, max_per_video)
 
     def temporal(self, texts, window_s=30.0, k=100, n_cand=None, max_per_video=None, ocr=None, use=None,
-                 rep='mid'):
+                 rep='mid', cap=None):
         """Chuoi su kien theo thu tu (tkis thuong co 3 cau: mo dau / sau do / cuoi cung).
 
         score = tong diem tung su kien (DP, xem chain_scores); moi su kien sau trong window_s giay sau
@@ -464,7 +569,7 @@ class SearchEngine:
         texts = [t for t in (texts if isinstance(texts, (list, tuple)) else [texts]) if t and t.strip()]
         if not texts:
             raise ValueError('Khong co cau truy van nao')
-        scores = [self.text_scores(t, use) for t in texts]
+        scores = [self.text_scores(t, use, cap) for t in texts]
         if len(scores) == 1:
             return self._rank(self._apply_ocr(scores[0], ocr, 3.0), k, max_per_video)
         combined, picks = chain_scores(scores, self.tkey, window_s)
@@ -563,6 +668,18 @@ if __name__ == '__main__':
                 best = max(best, ev[1][j] + ev[2][kk])
         if best > -np.inf:
             assert abs(tot7[i] - (ev[0][i] + best)) < 1e-9
+
+    # range_max / window_max_center khop vet can, ke ca o -inf
+    rng2 = np.random.default_rng(1)
+    v = rng2.normal(size=300)
+    v[rng2.choice(300, 60, replace=False)] = -np.inf
+    lo = rng2.integers(0, 299, 300)
+    hi = np.minimum(lo + rng2.integers(1, 70, 300), 300)
+    assert np.allclose(range_max(v, lo, hi), [v[a:b].max() for a, b in zip(lo, hi)])
+    wm = window_max_center(np.array([0, 5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.]), tkey, 10.0)
+    assert list(wm[:6]) == [5, 5, 5, 0, 0, 0] and list(wm[6:8]) == [1, 1], wm   # khong lan sang video 2
+    zf = zscore_finite(np.array([1.0, 3.0, -np.inf]))
+    assert np.isinf(zf[2]) and abs(zf[0] + zf[1]) < 1e-9
 
     # keyframe dai dien: 3 su kien -> B; 2 su kien -> gan diem giua; 1 -> chinh no
     assert chain_rep([0, 2, 4], tkey) == 2 and chain_rep([3], tkey) == 3
