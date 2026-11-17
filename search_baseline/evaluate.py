@@ -9,17 +9,24 @@ File cau hoi (.jsonl), moi dong 1 cau:
 Mot ket qua la DUNG neu cung video va frame_idx nam trong [start - tol, end + tol] (tol = --tol giay).
 
     python evaluate.py --index <data>/index --queries queries/gt_ui.jsonl --out runs/baseline.csv
+    python evaluate.py --index <data>/index --queries runs/gt/gt.jsonl --translate --out runs/b32.csv
+
+--translate: gt.jsonl tu collect_gt van la TIENG VIET -> dich sang tieng Anh truoc khi tim (giong o
+"Dich Viet->Anh" tren UI). Ban dich luu cache (queries/translate_cache.json), chay lai khong goi mang.
 """
 import argparse
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
 
 from engine import SearchEngine
+from video import sample_frames
 
 KS = (1, 5, 10, 20, 50, 100)
+VI_CHARS = re.compile(r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]', re.I)
 
 
 def load_queries(path):
@@ -40,51 +47,103 @@ def first_hit(results, q, tol_frames):
     return frame_rank, video_rank
 
 
+class Translator:
+    """Viet -> Anh qua endpoint cong khai cua Google (giong UI), co cache file. Cau khong dau giu nguyen."""
+
+    def __init__(self, cache_path='queries/translate_cache.json'):
+        self.path = cache_path
+        self.cache = json.load(open(cache_path, encoding='utf-8')) if os.path.exists(cache_path) else {}
+        self.dirty = False
+
+    def __call__(self, text):
+        if not text or not VI_CHARS.search(text):
+            return text
+        if text not in self.cache:
+            import requests
+            r = requests.get('https://translate.googleapis.com/translate_a/single',
+                             params={'client': 'gtx', 'sl': 'vi', 'tl': 'en', 'dt': 't', 'q': text}, timeout=20)
+            r.raise_for_status()
+            self.cache[text] = ''.join(x[0] for x in r.json()[0] if x and x[0])
+            self.dirty = True
+        return self.cache[text]
+
+    def save(self):
+        if self.dirty:
+            os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, ensure_ascii=False, indent=1)
+
+
+def report(df, title):
+    rk = df['rank'].astype('float')
+    vrk = df['video_rank'].astype('float')
+    print(f'\n{title} ({len(df)} cau)')
+    print('           ' + ''.join(f'R@{k:<6d}' for k in KS) + 'MRR')
+    print('khung dung ' + ''.join(f'{(rk <= k).mean():<8.3f}' for k in KS) + f'{np.nan_to_num(1 / rk).mean():.3f}')
+    print('video dung ' + ''.join(f'{(vrk <= k).mean():<8.3f}' for k in KS) + f'{np.nan_to_num(1 / vrk).mean():.3f}')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--index', required=True)
+    p.add_argument('--index', required=True, nargs='+', help='thu muc index (nhieu cai neu engine ho tro gop)')
+    p.add_argument('--weights', type=float, nargs='*', default=None, help='trong so tung --index (khi gop)')
     p.add_argument('--data', default=None)
     p.add_argument('--queries', required=True)
     p.add_argument('--k', type=int, default=100, help='so ket qua lay ra moi cau')
     p.add_argument('--tol', type=float, default=2.0, help='dung sai (giay) quanh khoang dap an')
     p.add_argument('--max-per-video', type=int, default=0)
+    p.add_argument('--translate', action='store_true', help='dich cau tieng Viet sang tieng Anh truoc khi tim')
     p.add_argument('--out', default=None, help='CSV ket qua tung cau (de so sanh giua cac lan cai tien)')
     a = p.parse_args()
 
-    eng = SearchEngine(a.index, a.data)
+    # 1 index -> goi nhu cu (chay duoc voi engine.py goc); nhieu index -> can engine.py ban gop
+    if len(a.index) == 1 and not a.weights:
+        eng = SearchEngine(a.index[0], a.data)
+    else:
+        eng = SearchEngine(a.index, a.data, weights=a.weights)
     fps_of = eng.meta.groupby('video')['fps'].first().to_dict()
+    tr = Translator() if a.translate else (lambda t: t)
     qs = load_queries(a.queries)
     rows = []
     for q in qs:
+        q.setdefault('query', '')
         if q['video'] not in fps_of:
             print(f'  !! bo qua {q.get("id")}: video {q["video"]} khong co trong index')
             continue
-        if q.get('query_b'):
-            res = eng.temporal([q['query'], q.get('query_b'), q.get('query_c')],
-                               q.get('window', 30.0), a.k, max_per_video=a.max_per_video or None)
+        texts = [tr(q.get(f)) for f in ('query', 'query_b', 'query_c')]
+        if q.get('clip'):          # vkis: truy van bang clip de bai, khong co chu
+            if not os.path.exists(q['clip']):
+                print(f'  !! bo qua {q.get("id")}: khong thay clip {q["clip"]}')
+                continue
+            res = eng.search_frames(sample_frames(open(q['clip'], 'rb').read()), a.k,
+                                    a.max_per_video or None)
+        elif q.get('query_b'):
+            res = eng.temporal(texts, q.get('window', 30.0), a.k, max_per_video=a.max_per_video or None)
         else:
-            res = eng.search(q['query'], a.k, a.max_per_video or None)
+            res = eng.search(texts[0], a.k, a.max_per_video or None)
         fr, vr = first_hit(res, q, a.tol * fps_of[q['video']])
-        rows.append({'id': q.get('id'), 'query': q['query'], 'video': q['video'],
-                     'rank': fr, 'video_rank': vr,
+        used = ' | '.join(t for t in texts if t) or os.path.basename(q.get('clip', ''))
+        rows.append({'id': q.get('id'), 'kind': q.get('kind') or ('vkis' if q.get('clip') else 'text'),
+                     'query': used, 'video': q['video'], 'rank': fr, 'video_rank': vr,
                      'top1': f'{res[0]["video"]}@{res[0]["frame_idx"]}' if res else ''})
+    if a.translate:
+        tr.save()
 
     df = pd.DataFrame(rows)
-    n = len(df)
-    if not n:
+    if not len(df):
         raise SystemExit('Khong co cau hoi hop le')
-    rk = df['rank'].astype('float')
-    vrk = df['video_rank'].astype('float')
-    print(f'\n{n} cau hoi | model {eng.info["model"]} ({eng.info["pretrained"]}) | '
-          f'{eng.info["n_keyframes"]:,} keyframe | tol {a.tol}s')
-    print('           ' + ''.join(f'R@{k:<6d}' for k in KS) + 'MRR')
-    print('khung dung ' + ''.join(f'{(rk <= k).mean():<8.3f}' for k in KS) + f'{np.nan_to_num(1 / rk).mean():.3f}')
-    print('video dung ' + ''.join(f'{(vrk <= k).mean():<8.3f}' for k in KS) + f'{np.nan_to_num(1 / vrk).mean():.3f}')
+    print(f'\n{len(df)} cau hoi | model {eng.info["model"]} ({eng.info["pretrained"]}) | '
+          f'{eng.info["n_keyframes"]:,} keyframe | tol {a.tol}s | dich {"co" if a.translate else "KHONG"}')
+    report(df, 'TAT CA')
+    if df['kind'].nunique() > 1:
+        for kind, g in df.groupby('kind'):
+            report(g, kind)
     miss = df[df['rank'].isna()]
     if len(miss):
         print(f'\n{len(miss)} cau khong tim thay trong top {a.k}:')
         for _, r in miss.head(15).iterrows():
-            print(f'  {r["id"]}: {r["query"][:80]}  (dap an {r["video"]}, video dung o rank {r["video_rank"]})')
+            print(f'  {r["id"]} [{r["kind"]}]: {r["query"][:80]}  (dap an {r["video"]}, '
+                  f'video dung o rank {r["video_rank"]})')
     if a.out:
         os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
         df.to_csv(a.out, index=False)
