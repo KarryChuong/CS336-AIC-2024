@@ -7,6 +7,10 @@
 
 Session cache lai; gap 401 thi login lai 1 lan.
 
+Nhieu evaluation cung ACTIVE (vd "De thi thu" + "De thi"): chon bang DRES_EVAL (hoac --dres-eval)
+= id day du, vai ky tu dau cua id (vd a64a8da4), hoac dung ten. Khong chon ma co >1 cai ACTIVE
+-> bao loi, KHONG tu chon (nop nham evaluation la mat diem that).
+
 Tu kiem tra (khong can mang):  python dres.py
 """
 import os
@@ -32,10 +36,38 @@ def build_body(video, frame_idx, fps, text=None):
     return {'answerSets': [{'answers': [answer]}]}, ms
 
 
+def select_evaluation(evs, want=None):
+    """(id, name) cua evaluation can dung trong list tu /client/evaluation/list.
+
+    want: id day du / tien to id / dung ten (khong phan biet hoa thuong). None -> chi hop le khi
+    dung 1 cai ACTIVE. Chon theo want thi khong bat buoc ACTIVE (de bao loi ro hon o buoc nop).
+    """
+    def show(es):
+        return '; '.join(f'{e.get("id")} "{e.get("name")}" {e.get("status")}' for e in es) or '(khong co)'
+
+    if want:
+        w = want.strip().lower()
+        hit = [e for e in evs if str(e.get('id', '')).lower() == w]
+        hit = hit or [e for e in evs if str(e.get('name', '')).strip().lower() == w]
+        hit = hit or [e for e in evs if str(e.get('id', '')).lower().startswith(w)]
+        if len(hit) != 1:
+            why = 'khong thay' if not hit else f'trung {len(hit)} cai'
+            raise RuntimeError(f'DRES_EVAL="{want}" {why}. Dang co: {show(evs)}')
+        return hit[0]['id'], hit[0].get('name', hit[0]['id'])
+    act = [e for e in evs if str(e.get('status')).upper() == 'ACTIVE']
+    if not act:
+        raise RuntimeError('Khong co evaluation nao dang ACTIVE')
+    if len(act) > 1:
+        raise RuntimeError(f'Co {len(act)} evaluation ACTIVE -> dat DRES_EVAL=<id hoac ten>. '
+                           f'Dang co: {show(act)}')
+    return act[0]['id'], act[0].get('name', act[0]['id'])
+
+
 class Dres:
-    def __init__(self, base_url, username, password, timeout=15):
+    def __init__(self, base_url, username, password, timeout=15, evaluation=None):
         self.base = base_url.rstrip('/')
         self.user, self.pwd, self.timeout = username, password, timeout
+        self.evaluation = evaluation or None    # id / tien to id / ten; None = cai ACTIVE duy nhat
         self.session_id = None
 
     def _login(self):
@@ -64,10 +96,7 @@ class Dres:
         r = self._req('GET', '/api/v2/client/evaluation/list')
         if not r.ok:
             raise RuntimeError(f'Lay evaluation list that bai: HTTP {r.status_code} {r.text[:200]}')
-        ev = next((e for e in r.json() if str(e.get('status')).upper() == 'ACTIVE'), None)
-        if not ev:
-            raise RuntimeError('Khong co evaluation nao dang ACTIVE')
-        return ev['id'], ev.get('name', ev['id'])
+        return select_evaluation(r.json(), self.evaluation)
 
     def submit(self, video, frame_idx, fps, text=None):
         eid, name = self.active_evaluation()
@@ -82,12 +111,14 @@ class Dres:
                 'description': data.get('description')}
 
 
-def from_env(url=None, user=None, pwd=None):
-    """Tra ve Dres neu du 3 thong tin (uu tien tham so, sau do bien moi truong), nguoc lai None."""
+def from_env(url=None, user=None, pwd=None, evaluation=None):
+    """Tra ve Dres neu du 3 thong tin (uu tien tham so, sau do bien moi truong), nguoc lai None.
+    evaluation / DRES_EVAL: tuy chon, chon evaluation khi co nhieu cai cung chay."""
     url = url or os.getenv('DRES_URL')
     user = user or os.getenv('DRES_USER')
     pwd = pwd or os.getenv('DRES_PASS')
-    return Dres(url, user, pwd) if (url and user and pwd) else None
+    evaluation = evaluation or os.getenv('DRES_EVAL')
+    return Dres(url, user, pwd, evaluation=evaluation) if (url and user and pwd) else None
 
 
 if __name__ == '__main__':
@@ -103,4 +134,36 @@ if __name__ == '__main__':
     assert body == {'answerSets': [{'answers': [{'text': 'QA-abc'}]}]}, body
     assert from_env(None, None, None) is None or os.getenv('DRES_URL')
     assert from_env('http://x:5000/', 'u', 'p').base == 'http://x:5000'
+
+    # 2 evaluation cung chay nhu tren aiclub: phai chon dung, khong duoc lay cai dau tien
+    evs = [{'id': 'bcb482c6-2b9e-4908-877a-e5ccd7c04640', 'name': 'Đề thi thử', 'status': 'ACTIVE'},
+           {'id': 'a64a8da4-9b83-4431-965e-262667dfe0d1', 'name': 'Đề thi', 'status': 'ACTIVE'},
+           {'id': 'ffff0000-old', 'name': 'Cu', 'status': 'ENDED'}]
+    for w in ('a64a8da4', 'A64A8DA4-9b83-4431-965e-262667dfe0d1', 'Đề thi', ' đề thi '):
+        assert select_evaluation(evs, w) == ('a64a8da4-9b83-4431-965e-262667dfe0d1', 'Đề thi'), w
+    assert select_evaluation(evs, 'Đề thi thử')[0].startswith('bcb482c6')
+    for w, msg in ((None, 'Co 2 evaluation ACTIVE'), ('zzz', 'khong thay'), ('', 'Co 2')):
+        try:
+            select_evaluation(evs, w)
+            raise AssertionError(f'phai bao loi voi {w!r}')
+        except RuntimeError as e:
+            assert msg in str(e) and 'a64a8da4' in str(e), str(e)
+    try:
+        select_evaluation([{'id': 'ab1', 'name': 'x'}, {'id': 'ab2', 'name': 'y'}], 'ab')
+        raise AssertionError('tien to trung phai bao loi')
+    except RuntimeError as e:
+        assert 'trung 2' in str(e)
+    assert select_evaluation(evs[2:] + evs[:1]) == (evs[0]['id'], 'Đề thi thử')   # 1 ACTIVE -> tu chon
+    assert from_env('http://x', 'u', 'p', 'a64a8da4').evaluation == 'a64a8da4'
+
+    class FakeR:
+        ok, status_code = True, 200
+        def json(self):
+            return evs
+
+    class Fake(Dres):
+        def _req(self, method, path, **kw):
+            assert path == '/api/v2/client/evaluation/list'
+            return FakeR()
+    assert Fake('http://x', 'u', 'p', evaluation='a64a8da4').active_evaluation()[1] == 'Đề thi'
     print('dres.py selftest OK')

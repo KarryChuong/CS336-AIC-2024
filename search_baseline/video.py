@@ -15,8 +15,9 @@ def _to_pil(frame_bgr):
     return Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
 
-def sample_frames(data: bytes, n=0, every_s=0.5, max_n=30, min_n=4):
-    """Khung hinh cach deu -> list PIL.Image RGB. Khong doc duoc -> ValueError.
+def sample_frames(data: bytes, n=0, every_s=0.5, max_n=30, min_n=4, return_times=False):
+    """Khung hinh cach deu -> list PIL.Image RGB (return_times=True: kem list giay cua tung khung,
+    de VKIS can khung theo thoi gian). Khong doc duoc -> ValueError.
 
     n=0 (mac dinh): 2 khung/giay, toi da max_n khung -> clip dai hon 15s thi tu giam mat do
     (30 khung trai deu ca clip) de khong no so lan goi model.
@@ -35,18 +36,20 @@ def sample_frames(data: bytes, n=0, every_s=0.5, max_n=30, min_n=4):
             if not cap.isOpened():
                 raise ValueError('cv2 khong mo duoc video')
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
             if n == 0:
-                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
                 dur = total / fps if total > 0 else 0
                 n = max(min_n, min(max_n, round(dur / every_s))) if dur else min_n
-            out = []
+            out, times = [], []
             if total > 0:
                 # lay giua moi doan -> tranh khung dau/cuoi hay bi den
                 for i in range(n):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, min(int(total * (i + 0.5) / n), total - 1))
+                    pos = min(int(total * (i + 0.5) / n), total - 1)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
                     ok, fr = cap.read()
                     if ok:
                         out.append(_to_pil(fr))
+                        times.append(pos / fps)
             if not out:
                 # shortcut: container khong bao so frame -> chi quet ~n*15 khung dau.
                 # Nang cap khi gap clip dai ma header thieu nb_frames.
@@ -59,10 +62,11 @@ def sample_frames(data: bytes, n=0, every_s=0.5, max_n=30, min_n=4):
                         break
                     if i % 15 == 0:
                         out.append(_to_pil(fr))
+                        times.append(i / fps)
                     i += 1
             if not out:
                 raise ValueError('Video khong co khung hinh nao doc duoc')
-            return out
+            return (out, times) if return_times else out
         finally:
             cap.release()
     finally:
@@ -105,6 +109,10 @@ if __name__ == '__main__':
     assert len(sample_frames(make_mp4(150))) == 30          # 15s -> 30 khung, van du 2/giay
     assert len(sample_frames(make_mp4(10))) == 4            # 1s -> 2 khung nhung kep len min 4
     assert len(sample_frames(make_mp4(300))) == 30          # 30s -> kep xuong 30 (1/giay)
+
+    # thoi diem: 6s @10fps, 12 khung -> giua moi doan 0.5s, tang dan, nam trong [0, 6)
+    fr_t, ts = sample_frames(data, return_times=True)
+    assert len(fr_t) == len(ts) == 12 and ts == sorted(ts) and 0 <= ts[0] < 0.5 and ts[-1] < 6, ts
 
     for bad in (b'', b'khong phai video'):
         try:

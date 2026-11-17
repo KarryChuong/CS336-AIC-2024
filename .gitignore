@@ -9,8 +9,9 @@ Client-Examples/
 
 # Ket qua chay: chua de bai DRES that va clip muc tieu -> khong cong khai
 search_baseline/runs/
-search_baseline/queries/gt_ui.jsonl
+search_baseline/queries/
 
 __pycache__/
 *.pyc
 .venv
+gt_std/

@@ -141,20 +141,75 @@ python collect_gt.py --index ... --tasks runs/tasks --out runs/gt_new   # chi ta
 |---|---|
 | `runs/tasks/` | task mới, `capture.py` còn đang theo dõi (chưa có đáp án) |
 | `runs/tasks_done/` | task đã xong, có `target_*.mp4` |
-| `runs/gt/` | `gt.jsonl`, `summary.csv`, `skip.txt`, ảnh keyframe đáp án |
+| `runs/gt/` | `gt.xlsx`, `gt.jsonl`, `summary.csv`, `skip.txt`, ảnh keyframe đáp án |
+
+`gt.xlsx` là bản để soát bằng mắt: mỗi câu một dòng, **ảnh keyframe nhúng thẳng trong ô**, kèm
+3 câu tiếng Việt và 3 câu tiếng Anh cạnh nhau. Cột **SAI?** để trống cho bạn đánh dấu; sau đó
+chép cột `id` của những dòng đó vào `skip.txt` rồi chạy lại.
+
+Vòng thi thử chạy lại cùng một đề nhiều lần; mỗi lần DRES cấp `taskId` mới nên `capture.py`
+tạo thêm thư mục. `collect_gt.py` **gom theo `taskId` trong `hint.json`** (id của template, ổn định)
+và giữ bản tốt nhất — ưu tiên bản có clip đáp án, rồi nhiều câu hint hơn, rồi mới nhất.
+Thực tế: 71 thư mục trên đĩa → 35 task thật.
 
 **Phải liếc qua các ảnh `.jpg`.** Điểm cao không đảm bảo đúng: clip đáp án hay mở đầu bằng cảnh
 studio/MC dùng chung cho mọi bản tin, khớp 0.96 với hàng trăm bản tin khác. Đã thử lọc tự động
 bằng margin (top1 trừ video khác tốt nhất) — **không tách được** cái sai khỏi cái đúng
-(sai +0.0117 vs đúng +0.0186). Thấy ảnh nào sai thì thêm task id vào `runs/gt/skip.txt`,
-chạy lại sẽ bỏ qua.
+(sai +0.0117 vs đúng +0.0186). Thấy ảnh nào sai thì thêm id vào `runs/gt/skip.txt`, chạy lại
+sẽ bỏ qua. **Nên ghi `taskId` của template** (cột `tid` trong `summary.csv`) chứ không phải tên
+thư mục — tên thư mục đổi mỗi lần đề chạy lại, câu sai sẽ lẻn về dưới id khác.
 
-Số đo nền (9 câu, tol 3s, ViT-B-32):
+Số đo nền (10 câu, tol 3s, ViT-B-32, index 427k keyframe):
 
-| | R@1 video đúng |
-|---|---|
-| Câu tiếng Việt nguyên bản | **0.000** |
-| Cùng câu đó, dịch sang tiếng Anh | **0.571** |
+| | R@1 | R@5 | R@20 | MRR |
+|---|---|---|---|---|
+| Tiếng Việt · video đúng | 0.000 | 0.000 | 0.000 | 0.000 |
+| **Tiếng Anh · video đúng** | **0.600** | 0.600 | 0.600 | 0.600 |
+| Tiếng Anh · khung đúng (±3s) | 0.400 | 0.500 | 0.600 | 0.455 |
+
+Dịch là từ **0% lên 60%**. Với ViT-B-32 thì tiếng Việt không phải "kém" mà là bằng không.
+
+**vkis** (`gt_vkis.jsonl`, 8 câu) đo riêng vì không có chữ: truy vấn bằng clip đề bài `00.mp4`,
+đáp án giải từ `target_*.mp4` — hai file khác nhau nên không vòng vo.
+
+| | R@1 | MRR |
+|---|---|---|
+| vkis · tìm bằng clip · khung đúng | **1.000** | 1.000 |
+
+```bash
+python evaluate.py --index <index> --queries runs/gt/gt_vkis.jsonl --tol 3
+```
+
+Tức khi đáp án nằm trong dữ liệu, tìm bằng clip **không trượt câu nào**. Nút thắt của vkis là
+đáp án có nằm trong bộ hay không, không phải chất lượng tìm kiếm.
+
+`start`/`end` của GT lấy bằng **độ dài clip đáp án** quanh khung khớp nhất, không phải một khung:
+khung khớp nhất với clip thường rơi vào cảnh nổi bật (câu B hoặc C), trong khi truy vấn chuỗi
+trả về khung của câu A — cách nhau hàng chục giây. Lấy một khung thì "khung đúng" ra 0.000 dù
+hệ thống tìm đúng.
+
+## Tạo thêm GT bằng clip cắt ngẫu nhiên
+
+Vòng thi thử chỉ cho ~10 câu tkis. Muốn thêm thì cắt clip ngẫu nhiên từ chính bộ dữ liệu rồi
+nhờ công cụ khác (NotebookLM, Gemini…) **viết mô tả** — như vậy câu hỏi không bị thiên lệch theo
+chỗ mạnh của CLIP, điều sẽ xảy ra nếu người làm hệ thống tự viết.
+
+```powershell
+python cut_clips.py                                  # 10 clip 30s -> runs/gt_clips/
+#   dua clipNN.mp4 (hoac clipNN_sheet.jpg neu cong cu khong nhan video)
+#   + prompt_notebooklm.md  -> dan ket qua vao runs/gt_clips/mota.txt
+python descriptions_to_gt.py --text runs/gt_clips/mota.txt
+python evaluate.py --index <index> --queries runs/gt_clips/gt_clips.jsonl --tol 3
+```
+
+Clip đặt tên `clip01…clip10` chứ không theo tên video, đáp án để riêng trong `answers.csv` —
+công cụ viết mô tả không biết đáp án, và lúc bạn tự test cũng không bị lộ.
+
+Mỗi clip phải qua kiểm tra: tìm bằng chính nó ra đúng video nguồn, score ≥ 0.90 và ít nhất
+4/10 kết quả đầu cùng video. Bước này loại đoạn toàn cảnh studio/MC — thứ khớp 0.96 với hàng
+trăm bản tin khác và từng làm hỏng một câu GT.
+
+Mô tả sinh ra là **tiếng Việt**, nhớ bật ô "Dịch Việt→Anh" hoặc dịch trước khi đo.
 
 ## Đánh giá: làm trước khi cải tiến
 
