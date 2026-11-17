@@ -306,7 +306,7 @@ function render() {
     const c = document.createElement('div');
     c.className = 'card'; c.tabIndex = 0; c.dataset.id = r.id;
     c.innerHTML = `<span class="rank">${i + 1}</span><img loading="lazy" src="/img/${r.id}" alt="">`
-      + (r.next ? `<img class="next" loading="lazy" src="/img/${r.next.id}" title="B: ${fmtTime(r.next.pts_time)}" alt="">` : '')
+      + (r.first && r.first.id !== r.id ? `<img class="next" loading="lazy" src="/img/${r.first.id}" title="A (mở đầu): ${fmtTime(r.first.pts_time)}" alt="">` : '')
       + `<div class="fb"><button data-v="pos" title="Đúng cảnh cần tìm">✓</button><button data-v="neg" title="Sai">✗</button></div>`
       + `<div class="cap"><b>${r.video}</b><span>${fmtTime(r.pts_time)}</span><span class="muted">${r.score?.toFixed(3) ?? ''}</span></div>`;
     c.onclick = e => {
@@ -358,7 +358,7 @@ async function openDrawer(i, item) {
     + `<span>thời điểm</span><span>${fmtTime(r.pts_time)} (${r.pts_time}s)</span>`
     + (r.score != null ? `<span>score</span><span>${r.score}</span>` : '')
     + (r.ocr ? `<span>OCR</span><span>${esc(r.ocr)}</span>` : '')
-    + (r.next ? `<span>B khớp nhất</span><span>${fmtTime(r.next.pts_time)} (frame ${r.next.frame_idx}, ${r.next.score})</span>` : '');
+    + (r.chain ? `<span>chuỗi</span><span>${r.chain.map((e, n) => `${'ABCDE'[n]} ${fmtTime(e.pts_time)} (f ${e.frame_idx})`).join(' → ')}</span>` : '');
   $('dSim').onclick = () => { closeDrawer(); run(`/api/similar/${r.id}?k=${$('k').value}&max_per_video=${$('mpv').value}${extra()}`, `Tương tự ${r.video} @ ${fmtTime(r.pts_time)}`); };
   $('dCopy').onclick = () => navigator.clipboard.writeText(`${r.video},${r.frame_idx}`).then(() => toast('Đã copy'));
   $('dGt').onclick = async () => {

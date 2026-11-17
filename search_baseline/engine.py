@@ -80,6 +80,24 @@ def chain_scores(scores, tkey, window_s):
     return val, picks
 
 
+def chain_rep(ev, tkey):
+    """Keyframe dai dien cho 1 chuoi su kien ev = [A, B, C, ...] (chi so keyframe, tang dan).
+
+    So le -> su kien giua (3 cau -> B); chan -> keyframe gan diem giua thoi gian nhat (trong [dau, cuoi]).
+    Ly do: A ('mo dau la...') hay khop som hon doan dap an vai giay; su kien giua nam trong doan
+    chac hon -> nop DRES an toan hon.
+    """
+    if len(ev) <= 1:
+        return ev[0]
+    if len(ev) % 2:
+        return ev[len(ev) // 2]
+    lo, hi = ev[0], ev[-1]
+    mid = (tkey[lo] + tkey[hi]) / 2
+    j = int(np.searchsorted(tkey, mid))
+    cands = [c for c in (j - 1, j) if lo <= c <= hi]
+    return min(cands, key=lambda c: abs(tkey[c] - mid)) if cands else lo
+
+
 def dilate_mask(mask, tkey, window_s):
     """Keyframe qua neu co keyframe nao trong +-window_s giay (cung video) qua mask."""
     if window_s <= 0:
@@ -433,11 +451,13 @@ class SearchEngine:
         S = self.image_matrix(imgs, use)
         return self._rank(self._apply_ocr(self.clip_scores(S, times, tol), ocr, 3.0), k, max_per_video)
 
-    def temporal(self, texts, window_s=30.0, k=100, n_cand=None, max_per_video=None, ocr=None, use=None):
+    def temporal(self, texts, window_s=30.0, k=100, n_cand=None, max_per_video=None, ocr=None, use=None,
+                 rep='mid'):
         """Chuoi su kien theo thu tu (tkis thuong co 3 cau: mo dau / sau do / cuoi cung).
 
         score = tong diem tung su kien (DP, xem chain_scores); moi su kien sau trong window_s giay sau
-        su kien truoc, cung video. Tra ve keyframe dau chuoi, kem 'next' (su kien 2) va 'chain'.
+        su kien truoc, cung video. Moi ket qua kem 'chain' (A, B, C), 'first' (A), 'next' (B).
+        rep='mid' (mac dinh): keyframe tra ve (va nop) la su kien GIUA (chain_rep); 'first': A nhu cu.
         ocr: chu do phai xuat hien o dau do trong ca chuoi (+- window_s * so su kien).
         n_cand: giu tham so cu cho tuong thich, DP chay tren toan bo keyframe nen khong can.
         """
@@ -450,14 +470,25 @@ class SearchEngine:
         combined, picks = chain_scores(scores, self.tkey, window_s)
         combined = self._apply_ocr(combined, ocr, window_s * len(scores))
 
-        def extra(i):
-            js = picks(i)
-            if not js:
-                return {}
-            return {'next': self.row(js[0], float(scores[1][js[0]])),
-                    'chain': [self.row(j, float(scores[n + 1][j])) for n, j in enumerate(js)]}
-
-        return self._rank(combined, k, max_per_video, extra=extra)
+        # xep theo diem chuoi (moi neo A 1 diem), roi doi sang keyframe dai dien; nhieu neo cung ra
+        # 1 keyframe dai dien -> giu cai diem cao nhat
+        out, seen, per_video = [], set(), {}
+        for i in np.argsort(-combined, kind='stable'):
+            if not np.isfinite(combined[i]) or len(out) >= k:
+                break
+            ev = [int(i)] + picks(i)
+            r = chain_rep(ev, self.tkey) if rep == 'mid' else int(i)
+            v = self.video[r]
+            if r in seen or (max_per_video and per_video.get(v, 0) >= max_per_video):
+                continue
+            seen.add(r)
+            per_video[v] = per_video.get(v, 0) + 1
+            row = self.row(r, float(combined[i]))
+            if len(ev) > 1:
+                row['chain'] = [self.row(j, float(scores[n][j])) for n, j in enumerate(ev)]
+                row['first'], row['next'] = row['chain'][0], row['chain'][1]
+            out.append(row)
+        return out
 
     def neighbors(self, kf_id, radius=6):
         """Cac keyframe lien truoc/sau trong cung video."""
@@ -532,6 +563,11 @@ if __name__ == '__main__':
                 best = max(best, ev[1][j] + ev[2][kk])
         if best > -np.inf:
             assert abs(tot7[i] - (ev[0][i] + best)) < 1e-9
+
+    # keyframe dai dien: 3 su kien -> B; 2 su kien -> gan diem giua; 1 -> chinh no
+    assert chain_rep([0, 2, 4], tkey) == 2 and chain_rep([3], tkey) == 3
+    assert chain_rep([0, 4], tkey) == 2                  # t=0 va t=40 -> giua t=20 (chi so 2)
+    assert chain_rep([0, 1], tkey) in (0, 1)
 
     # loc OCR: khong dau, cum trong ngoac, OR bang ';'
     texts = pd.Series(['GIẢl PHÓNG KHÍ HIĐRO', 'phi 1 0 bru', '', 'Di tích Kim Long'])   # 'l' = OCR doc nham 'I'
