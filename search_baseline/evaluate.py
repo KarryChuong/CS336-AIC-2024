@@ -13,6 +13,9 @@ Mot ket qua la DUNG neu cung video va frame_idx nam trong [start - tol, end + to
 
 --translate: gt.jsonl tu collect_gt van la TIENG VIET -> dich sang tieng Anh truoc khi tim (giong o
 "Dich Viet->Anh" tren UI). Ban dich luu cache (queries/translate_cache.json), chay lai khong goi mang.
+
+--caption <index tit> (build_caption_index.py): cong diem khop nghia voi dong tit. --caption-weight nhan
+nhieu gia tri -> do lan luot trong 1 lan chay (chi tai model 1 lan), vd --caption-weight 0 0.3 0.6 1
 """
 import argparse
 import json
@@ -94,16 +97,42 @@ def main():
     p.add_argument('--max-per-video', type=int, default=0)
     p.add_argument('--translate', action='store_true', help='dich cau tieng Viet sang tieng Anh truoc khi tim')
     p.add_argument('--out', default=None, help='CSV ket qua tung cau (de so sanh giua cac lan cai tien)')
+    p.add_argument('--caption', default=None, help='thu muc index tit (build_caption_index.py)')
+    p.add_argument('--caption-weight', type=float, nargs='+', default=[0.5],
+                   help='trong so diem tit; nhieu gia tri -> do lan luot')
     a = p.parse_args()
 
-    # 1 index -> goi nhu cu (chay duoc voi engine.py goc); nhieu index -> can engine.py ban gop
-    if len(a.index) == 1 and not a.weights:
+    # 1 index -> goi nhu cu (chay duoc voi engine.py goc); nhieu index / tit -> can engine.py ban gop
+    if len(a.index) == 1 and not a.weights and not a.caption:
         eng = SearchEngine(a.index[0], a.data)
     else:
-        eng = SearchEngine(a.index, a.data, weights=a.weights)
-    fps_of = eng.meta.groupby('video')['fps'].first().to_dict()
+        eng = SearchEngine(a.index, a.data, weights=a.weights, caption_dir=a.caption)
     tr = Translator() if a.translate else (lambda t: t)
     qs = load_queries(a.queries)
+    weights = a.caption_weight if a.caption else [None]
+    summary = []
+    for w in weights:
+        if w is not None:
+            eng.caption_weight = w
+        df = run_all(eng, qs, a, tr)
+        if len(weights) == 1:
+            full_report(eng, df, a)
+            save(df, a.out)
+        else:
+            rk, vrk = df['rank'].astype('float'), df['video_rank'].astype('float')
+            summary.append({'caption_weight': w, **{f'R@{k}': (rk <= k).mean() for k in (1, 5, 10, 20)},
+                            'MRR': np.nan_to_num(1 / rk).mean(), 'video_R@1': (vrk <= 1).mean(),
+                            'video_MRR': np.nan_to_num(1 / vrk).mean()})
+            save(df, a.out and f'{os.path.splitext(a.out)[0]}_w{w:g}.csv')
+    if a.translate:
+        tr.save()
+    if summary:
+        print(f'\n{len(df)} cau | model {eng.info["model"]} | tit {eng.info.get("caption_model")} | khung dung:')
+        print(pd.DataFrame(summary).to_string(index=False, float_format=lambda x: f'{x:.3f}'))
+
+
+def run_all(eng, qs, a, tr):
+    fps_of = eng.meta.groupby('video')['fps'].first().to_dict()
     rows = []
     for q in qs:
         q.setdefault('query', '')
@@ -126,14 +155,23 @@ def main():
         rows.append({'id': q.get('id'), 'kind': q.get('kind') or ('vkis' if q.get('clip') else 'text'),
                      'query': used, 'video': q['video'], 'rank': fr, 'video_rank': vr,
                      'top1': f'{res[0]["video"]}@{res[0]["frame_idx"]}' if res else ''})
-    if a.translate:
-        tr.save()
-
     df = pd.DataFrame(rows)
     if not len(df):
         raise SystemExit('Khong co cau hoi hop le')
+    return df
+
+
+def save(df, path):
+    if path:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        df.to_csv(path, index=False)
+        print('->', path)
+
+
+def full_report(eng, df, a):
+    cap = f' | tit {eng.info.get("caption_model")} x{eng.caption_weight:g}' if getattr(eng, 'cap', None) else ''
     print(f'\n{len(df)} cau hoi | model {eng.info["model"]} ({eng.info["pretrained"]}) | '
-          f'{eng.info["n_keyframes"]:,} keyframe | tol {a.tol}s | dich {"co" if a.translate else "KHONG"}')
+          f'{eng.info["n_keyframes"]:,} keyframe | tol {a.tol}s | dich {"co" if a.translate else "KHONG"}{cap}')
     report(df, 'TAT CA')
     if df['kind'].nunique() > 1:
         for kind, g in df.groupby('kind'):
@@ -144,10 +182,6 @@ def main():
         for _, r in miss.head(15).iterrows():
             print(f'  {r["id"]} [{r["kind"]}]: {r["query"][:80]}  (dap an {r["video"]}, '
                   f'video dung o rank {r["video_rank"]})')
-    if a.out:
-        os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
-        df.to_csv(a.out, index=False)
-        print('\n->', a.out)
 
 
 if __name__ == '__main__':
