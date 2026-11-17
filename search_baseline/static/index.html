@@ -52,6 +52,11 @@ main { padding: 12px 16px 40px; }
 .card .cap b { font-weight: 600; }
 .card .rank { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,.65); color: #fff; font-size: 11px;
   padding: 0 5px; border-radius: 4px; }
+.card .fb { position: absolute; left: 4px; bottom: 30px; display: flex; gap: 4px; }
+.card .fb button { font-size: 12px; line-height: 1; padding: 3px 6px; border-radius: 4px; border: 1px solid #fff;
+  background: rgba(0,0,0,.55); color: #fff; cursor: pointer; }
+.card.pos { outline: 3px solid #16a34a; }
+.card.neg { opacity: .4; }
 .card .next { position: absolute; right: 4px; top: 4px; width: 38%; border: 2px solid #fff; border-radius: 4px; }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); padding: 40px 0; text-align: center; }
@@ -95,6 +100,14 @@ main { padding: 12px 16px 40px; }
   </div>
   <div class="row" id="rowC" hidden>
     <input type="text" id="qc" placeholder="Sự kiện CUỐI CÙNG (bỏ trống nếu chỉ có 2) — tkis thường có 3 câu">
+  </div>
+  <div class="row">
+    <input type="text" id="ocr" placeholder='Lọc chữ trên màn hình (OCR), gõ không dấu cũng được: hidro bru · "kim long" · nhiều điều kiện cách nhau bằng ;'>
+    <label class="small">Model <select id="enc"><option value="">tất cả (gộp)</option></select></label>
+    <label class="small" title="VKIS: căn các khung của clip theo đúng thứ tự thời gian trong video (tắt = lấy MAX như cũ)">
+      <input type="checkbox" id="align" checked> Căn thời gian (vkis)</label>
+    <button class="btn" id="fbGo" disabled title="Tìm lại theo các ảnh đã đánh dấu ✓ (đúng) / ✗ (sai) — Rocchio">Tìm lại theo ✓✗</button>
+    <button class="btn" id="fbClear" disabled title="Xoá mọi đánh dấu ✓ / ✗">Xoá ✓✗</button>
   </div>
   <div class="row">
     <label class="small">Top <select id="k"><option>100</option><option selected>200</option><option>500</option></select></label>
@@ -162,6 +175,19 @@ function setVerdict(msg, color) {
     if (el) { el.textContent = msg; el.style.color = color; }
   }
 }
+// tham so chung cho moi kieu tim: loc OCR + chon model
+const extra = () => `&ocr=${encodeURIComponent($('ocr').value.trim())}&enc=${encodeURIComponent($('enc').value)}`;
+const esc = s => String(s).replace(/[&<>"]/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[ch]));
+const fb = {pos: new Set(), neg: new Set()};   // danh dau dung/sai cho Rocchio, giu qua cac lan tim
+function fbUpdate() {
+  const n = fb.pos.size + fb.neg.size;
+  $('fbGo').disabled = !fb.pos.size; $('fbClear').disabled = !n;
+  $('fbGo').textContent = `Tìm lại theo ✓✗${n ? ` (${fb.pos.size}✓ ${fb.neg.size}✗)` : ''}`;
+  document.querySelectorAll('.card').forEach(c => {
+    const id = +c.dataset.id;
+    c.classList.toggle('pos', fb.pos.has(id)); c.classList.toggle('neg', fb.neg.has(id));
+  });
+}
 async function api(url, opt) { const r = await fetch(url, opt); if (!r.ok) throw new Error((await r.text()) || r.status); return r.json(); }
 
 fetch('/api/info').then(r => r.json()).then(j => {
@@ -170,6 +196,10 @@ fetch('/api/info').then(r => r.json()).then(j => {
     + (j.n_videos_playable ? ` · xem được ${j.n_videos_playable} video` : '')
     + (j.dres ? ` · DRES đã nối${j.dres_eval ? ` → "${j.dres_eval}"` : ' (chưa xác định evaluation!)'}` : '');
   $('dSubmit').disabled = $('dSubmitQa').disabled = !j.dres;
+  (j.encoders || []).forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; $('enc').appendChild(o); });
+  $('enc').parentElement.hidden = (j.encoders || []).length < 2;
+  if (!j.ocr_keyframes) { $('ocr').disabled = true; $('ocr').placeholder = 'Chưa có OCR (đặt <data>/ocr/<vid>.jsonl rồi chạy lại app)'; }
+  else $('info').textContent += ` · OCR ${j.ocr_keyframes.toLocaleString()} keyframe`;
   $('dSubmit').title = j.dres ? 'Nộp keyframe này lên DRES' : 'Chạy app với --dres-url/--dres-user/--dres-pass';
 });
 
@@ -200,7 +230,8 @@ async function toEnglish(s) {
 
 async function search() {
   let a = $('qa').value.trim(), b = $('qb').value.trim(), c = $('qc').value.trim();
-  if (!a) return;
+  const ocr = $('ocr').value.trim();
+  if (!a && !ocr) return;
   if ($('vi').checked) {
     $('status').textContent = 'đang dịch…';
     try {
@@ -212,25 +243,25 @@ async function search() {
   if (mode === 'temporal' && b) {
     lastQuery = {a, b, c};
     const q = `a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}&c=${encodeURIComponent(c)}`;
-    run(`/api/temporal?${q}&window=${$('win').value}&k=${k}&max_per_video=${mpv}`,
+    run(`/api/temporal?${q}&window=${$('win').value}&k=${k}&max_per_video=${mpv}${extra()}`,
         c ? 'A → B → C' : 'A → B');
   } else {
     lastQuery = {a, b: '', c: ''};
-    run(`/api/search?q=${encodeURIComponent(a)}&k=${k}&max_per_video=${mpv}`, 'Văn bản');
+    run(`/api/search?q=${encodeURIComponent(a)}&k=${k}&max_per_video=${mpv}${extra()}`, a ? 'Văn bản' : 'Chỉ OCR');
   }
 }
 $('go').onclick = search;
-['qa', 'qb', 'qc'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') search(); }));
+['qa', 'qb', 'qc', 'ocr'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') search(); }));
 
 async function searchByFile(file, what) {
   $('status').textContent = `đang tìm bằng ${what}…`; $('go').disabled = true;
   try {
-    const r = await fetch(`/api/search_image?k=${$('k').value}&max_per_video=${$('mpv').value}`,
+    const r = await fetch(`/api/search_image?k=${$('k').value}&max_per_video=${$('mpv').value}${extra()}&align=${$('align').checked ? 1 : 0}`,
       {method: 'POST', headers: {'Content-Type': 'application/octet-stream'}, body: file});
     if (!r.ok) throw new Error(await r.text());
     const j = await r.json();
     results = j.results; lastQuery = {a: '', b: '', c: ''}; render();
-    $('status').textContent = `${what}${j.frames > 1 ? ` (${j.frames} khung hình)` : ''}: `
+    $('status').textContent = `${what}${j.frames > 1 ? ` (${j.frames} khung hình, ${j.mode === 'align' ? 'căn thời gian' : 'MAX'})` : ''}: `
       + `${results.length} kết quả · ${j.ms} ms`;
   } catch (err) { $('status').textContent = 'Lỗi: ' + err.message; }
   $('go').disabled = false;
@@ -273,17 +304,40 @@ function render() {
   const frag = document.createDocumentFragment();
   results.forEach((r, i) => {
     const c = document.createElement('div');
-    c.className = 'card'; c.tabIndex = 0;
+    c.className = 'card'; c.tabIndex = 0; c.dataset.id = r.id;
     c.innerHTML = `<span class="rank">${i + 1}</span><img loading="lazy" src="/img/${r.id}" alt="">`
       + (r.next ? `<img class="next" loading="lazy" src="/img/${r.next.id}" title="B: ${fmtTime(r.next.pts_time)}" alt="">` : '')
+      + `<div class="fb"><button data-v="pos" title="Đúng cảnh cần tìm">✓</button><button data-v="neg" title="Sai">✗</button></div>`
       + `<div class="cap"><b>${r.video}</b><span>${fmtTime(r.pts_time)}</span><span class="muted">${r.score?.toFixed(3) ?? ''}</span></div>`;
-    c.onclick = () => openDrawer(i);
+    c.onclick = e => {
+      const v = e.target.dataset?.v;
+      if (!v) return openDrawer(i);
+      e.stopPropagation();
+      const other = v === 'pos' ? 'neg' : 'pos';
+      fb[other].delete(r.id);
+      fb[v].has(r.id) ? fb[v].delete(r.id) : fb[v].add(r.id);
+      fbUpdate();
+    };
     c.onkeydown = e => { if (e.key === 'Enter') openDrawer(i); };
     frag.appendChild(c);
   });
   g.appendChild(frag);
+  fbUpdate();
   window.scrollTo({top: 0});
 }
+
+$('fbGo').onclick = async () => {
+  $('status').textContent = 'đang tìm lại theo ✓✗…'; $('fbGo').disabled = true;
+  try {
+    const j = await api('/api/feedback', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pos: [...fb.pos], neg: [...fb.neg], text: lastQuery.a, ocr: $('ocr').value.trim(),
+        enc: $('enc').value, k: +$('k').value, max_per_video: +$('mpv').value})});
+    results = j.results; render();
+    $('status').textContent = `Theo ✓✗ (${fb.pos.size}✓ ${fb.neg.size}✗${lastQuery.a ? ' + câu truy vấn' : ''}): ${results.length} kết quả · ${j.ms} ms`;
+  } catch (e) { $('status').textContent = 'Lỗi: ' + e.message; }
+  fbUpdate();
+};
+$('fbClear').onclick = () => { fb.pos.clear(); fb.neg.clear(); fbUpdate(); };
 
 $('csv').onclick = () => {
   const lines = results.slice(0, 100).map(r => `${r.video},${r.frame_idx}`).join('\n') + '\n';
@@ -303,8 +357,9 @@ async function openDrawer(i, item) {
   $('dKv').innerHTML = `<span>video</span><span>${r.video}</span><span>frame_idx</span><span>${r.frame_idx}</span>`
     + `<span>thời điểm</span><span>${fmtTime(r.pts_time)} (${r.pts_time}s)</span>`
     + (r.score != null ? `<span>score</span><span>${r.score}</span>` : '')
+    + (r.ocr ? `<span>OCR</span><span>${esc(r.ocr)}</span>` : '')
     + (r.next ? `<span>B khớp nhất</span><span>${fmtTime(r.next.pts_time)} (frame ${r.next.frame_idx}, ${r.next.score})</span>` : '');
-  $('dSim').onclick = () => { closeDrawer(); run(`/api/similar/${r.id}?k=${$('k').value}&max_per_video=${$('mpv').value}`, `Tương tự ${r.video} @ ${fmtTime(r.pts_time)}`); };
+  $('dSim').onclick = () => { closeDrawer(); run(`/api/similar/${r.id}?k=${$('k').value}&max_per_video=${$('mpv').value}${extra()}`, `Tương tự ${r.video} @ ${fmtTime(r.pts_time)}`); };
   $('dCopy').onclick = () => navigator.clipboard.writeText(`${r.video},${r.frame_idx}`).then(() => toast('Đã copy'));
   $('dGt').onclick = async () => {
     if (!lastQuery.a) return toast('Chưa có câu truy vấn văn bản');

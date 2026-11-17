@@ -2,6 +2,10 @@
 
     python app.py --index D:/data/HCMAI24_keyframes/index --videos D:/4_Code/IR/batch1
     -> mo http://localhost:8000
+    python app.py --index .../index_siglip2 .../index --weights 1 0.5 ...   # gop 2 encoder
+
+--index: 1 hoac nhieu thu muc index (moi encoder 1 cai, cai DAU la chinh). --weights: trong so tung cai.
+--ocr: thu muc chua <vid>.jsonl OCR (mac dinh tu tim <data>/ocr/).
 
 --videos (tuy chon): thu muc chua .mp4 (tim de quy) de xem lai doan video quanh keyframe.
 --gt: file jsonl luu cac cap (cau truy van, dap an) bam "Luu lam GT" tren UI -> dung cho evaluate.py.
@@ -35,13 +39,24 @@ class GTItem(BaseModel):
     note: str = ''
 
 
+class FeedbackItem(BaseModel):
+    pos: list[int] = []
+    neg: list[int] = []
+    text: str = ''
+    ocr: str = ''
+    enc: str = ''
+    k: int = 100
+    max_per_video: int = 0
+
+
 class SubmitItem(BaseModel):
     kf_id: int
     text: str = ''      # khac rong -> nop dang VQA
 
 
-def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.jsonl', dres_client=None):
-    eng = SearchEngine(index_dir, data_dir)
+def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.jsonl', dres_client=None,
+               weights=None, ocr_dirs=None, engine=None):
+    eng = engine or SearchEngine(index_dir, data_dir, weights=weights, ocr_dirs=ocr_dirs)
     dres_eval_name = None
     if dres_client is not None:
         # kiem tra ngay luc khoi dong: sai DRES_EVAL / co 2 evaluation ma chua chon -> biet truoc khi nop
@@ -57,6 +72,15 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
         if not 0 <= kf_id < len(eng.meta):
             raise HTTPException(404, f'id {kf_id} khong ton tai')
 
+    def _timed(fn, **extra):
+        """Chay 1 truy van, loi dau vao (ValueError) -> HTTP 400 thay vi 500."""
+        t = time.time()
+        try:
+            res = fn()
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {'results': res, 'ms': round((time.time() - t) * 1000, 1), **extra}
+
     @app.get('/')
     def index():
         return FileResponse(STATIC / 'index.html')
@@ -67,48 +91,58 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
                 'dres': dres_client is not None, 'dres_eval': dres_eval_name}
 
     @app.get('/api/search')
-    def search(q: str, k: int = 100, max_per_video: int = 0):
-        t = time.time()
-        res = eng.search(q, k, max_per_video or None)
-        return {'results': res, 'ms': round((time.time() - t) * 1000, 1)}
+    def search(q: str = '', k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = ''):
+        """q rong + ocr -> chi loc theo chu tren man hinh."""
+        return _timed(lambda: eng.search(q, k, max_per_video or None, ocr=ocr, use=enc))
 
     @app.get('/api/temporal')
     def temporal(a: str, b: str = '', c: str = '', window: float = 30.0,
-                 k: int = 100, max_per_video: int = 0):
-        t = time.time()
-        res = eng.temporal([a, b, c], window, k, max_per_video=max_per_video or None)
-        return {'results': res, 'ms': round((time.time() - t) * 1000, 1)}
+                 k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = ''):
+        return _timed(lambda: eng.temporal([a, b, c], window, k, max_per_video=max_per_video or None,
+                                           ocr=ocr, use=enc))
 
     @app.post('/api/search_image')
-    async def search_image(request: Request, k: int = 100, max_per_video: int = 0, frames_n: int = 0):
+    async def search_image(request: Request, k: int = 100, max_per_video: int = 0, frames_n: int = 0,
+                           ocr: str = '', enc: str = '', align: int = 1, tol: float = 3.0):
         """Body la byte anh HOAC video tho.
 
         vkis: dan anh chup clip muc tieu, hoac tha thang file 00.mp4 ma capture.py luu ve.
-        Video -> lay khung cach deu (frames_n=0: tu chon theo do dai clip),
-        diem = MAX tren cac khung roi xep hang nhu truy van anh don.
+        Video -> lay khung cach deu (frames_n=0: tu chon theo do dai clip). align=1 (mac dinh): can
+        khung clip theo thoi gian trong cung video (engine.clip_scores); align=0: MAX tren khung nhu cu.
         """
         raw = await request.body()
         if not raw:
             raise HTTPException(400, 'Body rong, can byte anh hoac video')
+        times = None
         try:
             img = Image.open(io.BytesIO(raw))
             img.load()
             frames = [img.convert('RGB')]
         except Exception as img_err:
             try:
-                frames = sample_frames(raw, frames_n)         # vkis: ca clip de bai
+                frames, times = sample_frames(raw, frames_n, return_times=True)   # vkis: ca clip de bai
             except Exception as vid_err:
                 raise HTTPException(400, f'Khong doc duoc anh ({img_err}) cung khong phai video ({vid_err})')
-        t = time.time()
-        res = eng.search_frames(frames, k, max_per_video or None)
-        return {'results': res, 'ms': round((time.time() - t) * 1000, 1), 'frames': len(frames)}
+        mpv = max_per_video or None
+        if times and align and len(frames) > 1:
+            return _timed(lambda: eng.search_clip(frames, times, k, mpv, ocr=ocr, use=enc, tol=tol),
+                          frames=len(frames), mode='align')
+        return _timed(lambda: eng.search_frames(frames, k, mpv, ocr=ocr, use=enc), frames=len(frames), mode='max')
 
     @app.get('/api/similar/{kf_id}')
-    def similar(kf_id: int, k: int = 100, max_per_video: int = 0):
+    def similar(kf_id: int, k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = ''):
         _check(kf_id)
-        t = time.time()
-        res = eng.similar(kf_id, k, max_per_video or None)
-        return {'results': res, 'ms': round((time.time() - t) * 1000, 1)}
+        return _timed(lambda: eng.similar(kf_id, k, max_per_video or None, ocr=ocr, use=enc))
+
+    @app.post('/api/feedback')
+    def feedback(item: FeedbackItem):
+        """Rocchio: cac keyframe danh dau dung (pos) / sai (neg) + cau truy van hien tai."""
+        for i in item.pos + item.neg:
+            _check(i)
+        if not item.pos and not (item.text or '').strip():
+            raise HTTPException(400, 'Can it nhat 1 keyframe dung hoac cau truy van')
+        return _timed(lambda: eng.feedback(item.pos, item.neg, item.k, item.max_per_video or None,
+                                           ocr=item.ocr, use=item.enc, text=item.text))
 
     @app.get('/api/neighbors/{kf_id}')
     def neighbors(kf_id: int, r: int = 6):
@@ -160,7 +194,10 @@ if __name__ == '__main__':
     import uvicorn
 
     p = argparse.ArgumentParser()
-    p.add_argument('--index', required=True, help='thu muc index (tao boi build_index.py)')
+    p.add_argument('--index', required=True, nargs='+',
+                   help='thu muc index (build_index.py); nhieu cai = nhieu encoder, cai dau la chinh')
+    p.add_argument('--weights', type=float, nargs='*', default=None, help='trong so tung --index, vd 1 0.5')
+    p.add_argument('--ocr', nargs='*', default=None, help='thu muc <vid>.jsonl OCR (mac dinh <data>/ocr/)')
     p.add_argument('--data', default=None, help='OUT_DIR chua keyframes/*.tar (mac dinh lay tu info.json)')
     p.add_argument('--videos', default=None, help='thu muc .mp4 de xem lai video (tuy chon)')
     p.add_argument('--gt', default='queries/gt_ui.jsonl', help='file luu GT khi bam "Luu lam GT"')
@@ -174,4 +211,4 @@ if __name__ == '__main__':
     a = p.parse_args()
     client = dres.from_env(a.dres_url, a.dres_user, a.dres_pass, a.dres_eval)
     print(f'DRES: {client.base if client else "chua cau hinh -> nut Nop bi tat"}')
-    uvicorn.run(create_app(a.index, a.data, a.videos, a.gt, client), host=a.host, port=a.port)
+    uvicorn.run(create_app(a.index, a.data, a.videos, a.gt, client, a.weights, a.ocr), host=a.host, port=a.port)
