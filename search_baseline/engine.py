@@ -133,6 +133,31 @@ def zscore_finite(s):
     return z
 
 
+def attr_parts(attrs):
+    """'Mo ta theo o' tren UI -> danh sach (cau tieng Anh ngan, trong so).
+
+    Moi o thanh 1 cau RIENG, cham diem rieng roi moi cong (xem SearchEngine._attr_total). Khong noi
+    thanh 1 cau dai: text encoder SigLIP2 chi doc 64 token (B/32: 77), phan sau bi cat mat im lang.
+    Trong so am = o 'Loai tru' (tru diem nhung anh giong cau do).
+    attrs: dict who/act/where/objs/color/neg (da dich sang tieng Anh o UI), thieu o nao bo qua.
+    """
+    a = {k: str(v or '').strip().strip('.').strip() for k, v in (attrs or {}).items()}
+    low = {k: v[:1].lower() + v[1:] for k, v in a.items()}     # Google dich hay viet hoa chu dau
+    parts = []
+    subj = ' '.join(x for x in (a.get('who'), low.get('act')) if x)   # "workers in blue" + "stacking wood"
+    if subj:
+        parts.append((subj, 1.0))
+    if a.get('where'):
+        parts.append((f'a photo taken in {low["where"]}', 0.7))
+    if a.get('objs'):
+        parts.append((f'a photo full of {low["objs"]}', 0.5))
+    if a.get('color'):
+        parts.append((f'a photo with mostly {low["color"]} colors', 0.3))
+    if a.get('neg'):
+        parts.append((a['neg'], -0.5))
+    return parts
+
+
 def dilate_mask(mask, tkey, window_s):
     """Keyframe qua neu co keyframe nao trong +-window_s giay (cung video) qua mask."""
     if window_s <= 0:
@@ -273,6 +298,7 @@ class SearchEngine:
         self.frame_idx = self.meta['frame_idx'].to_numpy()
         self.pts = self.meta['pts_time'].to_numpy()
         codes, self.video_names = pd.factorize(self.meta['video'], sort=True)
+        self.vcode = codes
         # Khoa tang dan theo (video, thoi gian) -- index da sap san theo thu tu nay
         self.tkey = codes.astype(np.float64) * 1e6 + self.pts
         assert np.all(np.diff(self.tkey) >= 0), 'meta.csv chua sap theo (video, frame_idx) -- build lai index'
@@ -413,6 +439,39 @@ class SearchEngine:
             vis = zscore_finite(vis)
         return vis + w * self.caption_scores(text)
 
+    def _attr_total(self, attrs, use=None):
+        """(tong w * z-score cac o, tong trong so duong) hoac (None, 0) khi khong dien o nao.
+        Tinh 1 lan roi dung chung cho moi su kien A/B/C: cac o mo ta ca clip, khong rieng canh nao."""
+        parts = attr_parts(attrs)
+        if not parts:
+            return None, 0.0
+        tot = 0.0
+        for text, w in parts:
+            z = zscore_finite(self.text_scores(text, use, cap=0))
+            # o Loai tru: keyframe thieu diem (-inf) thi khong tru gi, tranh -w * -inf = +inf
+            tot = tot + w * (z if w > 0 else np.where(np.isfinite(z), z, 0.0))
+        return tot, float(sum(w for _, w in parts if w > 0))
+
+    def _combine(self, text, attr, use=None, cap=None):
+        """Diem 1 cau mo ta + cac o (attr tu _attr_total). Khong co o nao -> y het text_scores cu."""
+        tot, wsum = attr
+        if tot is None:
+            return self.text_scores(text, use, cap)
+        if text and text.strip():
+            tot, wsum = tot + zscore_finite(self.text_scores(text, use, cap)), wsum + 1.0
+        if wsum <= 0:
+            raise ValueError('Chi co o Loai tru: can them cau mo ta hoac it nhat 1 o khac')
+        return tot / wsum
+
+    def video_frames(self, video):
+        """Moi keyframe cua 1 video, theo thu tu thoi gian (de xem/chuyen ma video cho dong doi)."""
+        v = str(video).strip().upper()
+        if v not in self.video_names:
+            raise ValueError(f'Khong co video {v} (vd dung: L24_V025)')
+        c = self.video_names.get_loc(v)
+        lo, hi = np.searchsorted(self.vcode, c, 'left'), np.searchsorted(self.vcode, c, 'right')
+        return [self.row(i) for i in range(lo, hi)]
+
     def id_scores(self, kf_id, use=None):
         act = self._active(use)
         return self._fuse([self.encoders[i].id_scores(kf_id) for i in act], act)
@@ -464,10 +523,13 @@ class SearchEngine:
         r.update(kw)
         return r
 
-    def search(self, text, k=100, max_per_video=None, ocr=None, use=None, ocr_window=3.0, cap=None):
-        """Van ban; ocr (tuy chon) loc keyframe co chu do trong +-ocr_window giay. Bo trong text -> chi OCR."""
-        if text and text.strip():
-            scores = self.text_scores(text, use, cap)
+    def search(self, text, k=100, max_per_video=None, ocr=None, use=None, ocr_window=3.0, cap=None,
+               attrs=None):
+        """Van ban (+ cac o mo ta attrs); ocr (tuy chon) loc keyframe co chu do trong +-ocr_window giay.
+        Bo trong text va attrs -> chi OCR."""
+        attr = self._attr_total(attrs, use)
+        if (text and text.strip()) or attr[0] is not None:
+            scores = self._combine(text, attr, use, cap)
         elif ocr and ocr.strip():
             # chi loc OCR: dung keyframe co chu (khong noi cua so), xep theo thu tu video/thoi gian
             scores, ocr_window = 1.0 - np.arange(len(self.meta)) / len(self.meta), 0.0
@@ -557,7 +619,7 @@ class SearchEngine:
         return self._rank(self._apply_ocr(self.clip_scores(S, times, tol), ocr, 3.0), k, max_per_video)
 
     def temporal(self, texts, window_s=30.0, k=100, n_cand=None, max_per_video=None, ocr=None, use=None,
-                 rep='mid', cap=None):
+                 rep='mid', cap=None, attrs=None):
         """Chuoi su kien theo thu tu (tkis thuong co 3 cau: mo dau / sau do / cuoi cung).
 
         score = tong diem tung su kien (DP, xem chain_scores); moi su kien sau trong window_s giay sau
@@ -567,9 +629,12 @@ class SearchEngine:
         n_cand: giu tham so cu cho tuong thich, DP chay tren toan bo keyframe nen khong can.
         """
         texts = [t for t in (texts if isinstance(texts, (list, tuple)) else [texts]) if t and t.strip()]
+        attr = self._attr_total(attrs, use)     # attrs: cac o mo ta ca clip, cong vao MOI su kien
         if not texts:
-            raise ValueError('Khong co cau truy van nao')
-        scores = [self.text_scores(t, use, cap) for t in texts]
+            if attr[0] is None:
+                raise ValueError('Khong co cau truy van nao')
+            return self._rank(self._apply_ocr(self._combine('', attr, use, cap), ocr, 3.0), k, max_per_video)
+        scores = [self._combine(t, attr, use, cap) for t in texts]
         if len(scores) == 1:
             return self._rank(self._apply_ocr(scores[0], ocr, 3.0), k, max_per_video)
         combined, picks = chain_scores(scores, self.tkey, window_s)
@@ -695,4 +760,7 @@ if __name__ == '__main__':
     assert norm_vi('Đường Hồ Chí Minh!') == 'duong ho chi minh'
     m = dilate_mask(np.array([False, False, True, False, False, False] + [False] * 6), tkey, 10.0)
     assert list(m[:6]) == [False, True, True, True, False, False] and not m[6:].any()
+    assert attr_parts({}) == [] and attr_parts({'who': ' ', 'neg': ''}) == []
+    assert attr_parts({'act': 'Stacking wood.', 'where': 'Wood workshop', 'neg': 'graphics'}) == [
+        ('stacking wood', 1.0), ('a photo taken in wood workshop', 0.7), ('graphics', -0.5)]
     print('engine.py selftest OK')

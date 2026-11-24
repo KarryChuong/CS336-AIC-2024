@@ -15,6 +15,7 @@ import argparse
 import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 import dres
-from engine import SearchEngine
+from engine import SearchEngine, attr_parts
 from video import sample_frames      # import truc tiep: route 'def video(...)' se che mat module
 
 STATIC = Path(__file__).parent / 'static'
@@ -56,7 +57,8 @@ class SubmitItem(BaseModel):
 
 
 def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.jsonl', dres_client=None,
-               weights=None, ocr_dirs=None, engine=None, caption_dir=None, caption_weight=0.5):
+               weights=None, ocr_dirs=None, engine=None, caption_dir=None, caption_weight=0.5,
+               sub_log='runs/submissions.jsonl'):
     eng = engine or SearchEngine(index_dir, data_dir, weights=weights, ocr_dirs=ocr_dirs,
                                  caption_dir=caption_dir, caption_weight=caption_weight)
     dres_eval_name = None
@@ -99,16 +101,38 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
         return {**eng.info, 'device': eng.device, 'n_videos_playable': len(videos), 'gt_file': gt_file,
                 'dres': dres_client is not None, 'dres_eval': dres_eval_name}
 
+    def _attrs(v):
+        """attrs = JSON {"who": ..., "act": ..., "where": ..., "objs": ..., "color": ..., "neg": ...}."""
+        if not v or not v.strip():
+            return None
+        try:
+            d = json.loads(v)
+        except ValueError:
+            raise HTTPException(400, f'attrs khong phai JSON: {v[:100]!r}')
+        if not isinstance(d, dict):
+            raise HTTPException(400, 'attrs phai la object JSON')
+        return d
+
     @app.get('/api/search')
-    def search(q: str = '', k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = '', cap: str = ''):
-        """q rong + ocr -> chi loc theo chu tren man hinh."""
-        return _timed(lambda: eng.search(q, k, max_per_video or None, ocr=ocr, use=enc, cap=_cap(cap)))
+    def search(q: str = '', k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = '', cap: str = '',
+               attrs: str = ''):
+        """q rong + ocr -> chi loc theo chu tren man hinh. attrs: cac o mo ta (tra lai 'parts' da gui model)."""
+        at = _attrs(attrs)
+        return _timed(lambda: eng.search(q, k, max_per_video or None, ocr=ocr, use=enc, cap=_cap(cap), attrs=at),
+                      parts=attr_parts(at))
 
     @app.get('/api/temporal')
-    def temporal(a: str, b: str = '', c: str = '', window: float = 30.0,
-                 k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = '', cap: str = ''):
+    def temporal(a: str = '', b: str = '', c: str = '', window: float = 30.0,
+                 k: int = 100, max_per_video: int = 0, ocr: str = '', enc: str = '', cap: str = '',
+                 attrs: str = ''):
+        at = _attrs(attrs)
         return _timed(lambda: eng.temporal([a, b, c], window, k, max_per_video=max_per_video or None,
-                                           ocr=ocr, use=enc, cap=_cap(cap)))
+                                           ocr=ocr, use=enc, cap=_cap(cap), attrs=at), parts=attr_parts(at))
+
+    @app.get('/api/video_frames')
+    def video_frames(video: str):
+        """Moi keyframe cua 1 video theo thoi gian (o 'Ma video' tren UI)."""
+        return _timed(lambda: eng.video_frames(video))
 
     @app.post('/api/search_image')
     async def search_image(request: Request, k: int = 100, max_per_video: int = 0, frames_n: int = 0,
@@ -183,18 +207,44 @@ def create_app(index_dir, data_dir=None, video_dir=None, gt_file='queries/gt_ui.
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
         return {'ok': True, 'saved_to': os.path.abspath(gt_file)}
 
+    # Server dung chung (--host 0.0.0.0): moi lan nop ghi 1 dong ra console + runs/submissions.jsonl
+    # (ai nop, nop gi, DRES tra loi gi) -> loi nhu HTTP 500 xem lai duoc nguyen van.
+    def _log_submit(rec):
+        rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), **rec}
+        print('[NOP] ' + json.dumps(rec, ensure_ascii=False, default=str), flush=True)
+        try:
+            os.makedirs(os.path.dirname(sub_log) or '.', exist_ok=True)
+            with open(sub_log, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + '\n')
+        except OSError as e:
+            print(f'!! khong ghi duoc {sub_log}: {e}', flush=True)
+
+    # 2 nguoi bam Nop gan nhu cung luc -> 2 request song song toi DRES cung 1 tai khoan. Chi cho 1 luot
+    # nop chay tai 1 thoi diem; luot den sau bi tu choi ngay (KHONG tu nop lai: DRES co the da ghi nhan).
+    submit_lock = threading.Lock()
+
     @app.post('/api/submit')
-    def submit_dres(item: SubmitItem):
+    def submit_dres(item: SubmitItem, request: Request):
         if dres_client is None:
             raise HTTPException(400, 'Chua cau hinh DRES: chay app voi --dres-url/--dres-user/--dres-pass '
                                      'hoac dat bien moi truong DRES_URL/DRES_USER/DRES_PASS')
         _check(item.kf_id)
         row = eng.meta.iloc[item.kf_id]
+        rec = {'from': request.client.host if request.client else '?', 'video': str(row['video']),
+               'frame_idx': int(row['frame_idx']), 'text': item.text or None}
+        if not submit_lock.acquire(blocking=False):
+            _log_submit({**rec, 'result': 'BAN (dang co luot nop khac)'})
+            raise HTTPException(409, 'Đang có một lượt nộp khác chưa xong. Đợi vài giây, xem kết quả rồi mới nộp lại.')
         try:
-            return dres_client.submit(row['video'], int(row['frame_idx']), float(row['fps']),
-                                      text=item.text or None)
+            res = dres_client.submit(row['video'], int(row['frame_idx']), float(row['fps']),
+                                     text=item.text or None)
         except Exception as e:
+            _log_submit({**rec, 'error': f'{type(e).__name__}: {e}'})
             raise HTTPException(502, f'{type(e).__name__}: {e}')
+        finally:
+            submit_lock.release()
+        _log_submit({**rec, **res})
+        return res
 
     return app
 
