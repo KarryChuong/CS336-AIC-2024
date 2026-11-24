@@ -42,6 +42,15 @@ label.small { color: var(--muted); font-size: 12px; display: flex; gap: 4px; ali
 .btn:disabled { opacity: .5; cursor: default; }
 .status { color: var(--muted); font-size: 12px; min-height: 18px; }
 main { padding: 12px 16px 40px; }
+/* "Mo ta theo o": moi o la 1 cau ngan rieng, server cham diem tung o roi cong lai (engine.attr_parts) */
+.attrs { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+.attrs summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.attrs .cells { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 6px; }
+.attrs .cells label { display: grid; gap: 2px; font-size: 12px; color: var(--muted); }
+.attrs .cells input { width: 100%; }
+@media (max-width: 900px) { .attrs .cells { grid-template-columns: 1fr; } }
+#parts { font-size: 12px; }
+#vidBox { flex: 0 1 240px; }
 /* hang chip "Top 20": so keyframe moi video trong 20 ket qua dau (tu ban cua nhom), bam chip = loc theo video */
 .topvids { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 4px 0 10px; }
 .topvids:empty { display: none; }
@@ -110,6 +119,21 @@ main { padding: 12px 16px 40px; }
   <div class="row" id="rowC" hidden>
     <input type="text" id="qc" placeholder="Sự kiện CUỐI CÙNG (bỏ trống nếu chỉ có 2) — tkis thường có 3 câu">
   </div>
+  <details class="attrs" id="attrBox" open>
+    <summary>Mô tả theo ô (tuỳ chọn — áp cho cả clip, cộng thêm vào câu mô tả ở trên)</summary>
+    <div class="cells">
+      <label>Ai / cái gì <input type="text" data-attr="who" placeholder="vd: các cô chú công nhân mặc áo xanh dương"></label>
+      <label>Đang làm gì <input type="text" data-attr="act" placeholder="vd: xếp những thanh gỗ lên bàn"></label>
+      <label>Ở đâu <input type="text" data-attr="where" placeholder="vd: xưởng gỗ trong nhà"></label>
+      <label>Vật thể nhiều nhất <input type="text" data-attr="objs" placeholder="vd: thanh gỗ, người"></label>
+      <label>Màu chủ đạo <input type="text" data-attr="color" placeholder="vd: trắng, xanh dương (ghi rõ xanh dương / xanh lá)"></label>
+      <label>Loại trừ (không muốn thấy) <input type="text" data-attr="neg" placeholder="vd: đồ hoạ máy tính, phòng thu bản tin"></label>
+    </div>
+    <div class="row" style="margin-top:4px">
+      <button class="btn" id="attrClear" type="button">Xoá các ô</button>
+      <span class="status" id="parts"></span>
+    </div>
+  </details>
   <div class="row">
     <input type="text" id="ocr" placeholder='Lọc chữ trên màn hình (OCR), gõ không dấu cũng được: hidro bru · "kim long" · nhiều điều kiện cách nhau bằng ;'>
     <label class="small">Model <select id="enc"><option value="">tất cả (gộp)</option></select></label>
@@ -129,6 +153,9 @@ main { padding: 12px 16px 40px; }
     <button class="btn" id="up" title="Tìm bằng file ảnh hoặc video (clip đề bài vkis)">Tải ảnh/video…</button>
     <input type="file" id="upFile" accept="image/*,video/*" hidden>
     <button class="btn" id="csv" disabled title="Xuất top 100 dạng video,frame_idx">Xuất CSV</button>
+    <input type="text" id="vidBox" placeholder="Mã video: L24_V025 hoặc L24_V025 5:30"
+      title="Xem mọi keyframe của 1 video theo thời gian. Thêm thời điểm (5:30) hoặc ,frame (L24_V025,15690) để nhảy tới đó">
+    <button class="btn" id="vidGo" title="Xem cả video theo thời gian">Xem cả video</button>
     <span class="status" id="status"></span>
     <span id="subStatus" style="font-weight:700"></span>
   </div>
@@ -155,7 +182,8 @@ main { padding: 12px 16px 40px; }
     <div class="row">
       <button class="btn primary" id="dSim">Tìm cảnh tương tự</button>
       <button class="btn" id="dGt">Lưu làm GT cho câu truy vấn</button>
-      <button class="btn" id="dCopy">Copy video,frame</button>
+      <button class="btn" id="dVid" title="Mở mọi keyframe của video này theo thời gian, nhảy tới đúng chỗ này">Xem cả video</button>
+      <button class="btn" id="dCopy" title="Copy dạng L24_V025 8:43.0 để gửi đồng đội — họ dán vào ô Mã video">Copy mã + thời điểm</button>
       <button class="btn" id="dSubmit" disabled title="Nộp video + thời điểm của keyframe này (tkis/vkis)">Nộp KIS (video + thời điểm)</button>
       <span id="dVerdict" style="font-weight:700;align-self:center"></span>
     </div>
@@ -201,7 +229,25 @@ function fbUpdate() {
     c.classList.toggle('pos', fb.pos.has(id)); c.classList.toggle('neg', fb.neg.has(id));
   });
 }
-async function api(url, opt) { const r = await fetch(url, opt); if (!r.ok) throw new Error((await r.text()) || r.status); return r.json(); }
+async function api(url, opt) {
+  const r = await fetch(url, opt);
+  if (!r.ok) {   // FastAPI tra {"detail": "..."} -> chi hien cau bao loi, khong hien ca JSON
+    const t = await r.text();
+    let msg = t;
+    try { msg = JSON.parse(t).detail || t; } catch (e) { /* khong phai JSON */ }
+    throw new Error(msg || r.status);
+  }
+  return r.json();
+}
+// navigator.clipboard chi chay tren https/localhost; dong doi vao http://<IP>:port thi phai dung cach cu
+function copyText(s) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(s);
+  const t = document.createElement('textarea');
+  t.value = s; t.style.position = 'fixed'; t.style.opacity = '0';
+  document.body.appendChild(t); t.select();
+  const ok = document.execCommand('copy'); t.remove();
+  return ok ? Promise.resolve() : Promise.reject(new Error('trình duyệt chặn copy'));
+}
 
 fetch('/api/info').then(r => r.json()).then(j => {
   info = j;
@@ -226,11 +272,19 @@ document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
   $('rowB').hidden = $('rowC').hidden = mode !== 'temporal';
 });
 
+// cac cau ngan server da gui vao model cho tung o (de biet o nao dich ra sao)
+function showParts(parts) {
+  $('parts').textContent = parts && parts.length
+    ? 'Model nhận thêm: ' + parts.map(([t, w]) => w < 0 ? `trừ "${t}" ×${-w}` : `"${t}" ×${w}`).join(' · ')
+    : '';
+}
+
 async function run(url, label) {
   $('status').textContent = 'đang tìm…'; $('go').disabled = true;
+  if (location.hash) history.replaceState(null, '', location.pathname);   // bo #v=... cua lan xem video truoc
   try {
     const j = await api(url);
-    results = j.results; render();
+    results = j.results; render(); showParts(j.parts);
     $('status').textContent = `${label}: ${results.length} kết quả · ${j.ms} ms`;
   } catch (e) { $('status').textContent = 'Lỗi: ' + e.message; }
   $('go').disabled = false;
@@ -251,30 +305,92 @@ async function toEnglish(s) {
   return (await r.json())[0].map(x => x[0]).join('');
 }
 
+// "Mo ta theo o": {who, act, where, objs, color, neg} -> server ghep thanh cau ngan, cham rieng tung o
+const attrInputs = [...document.querySelectorAll('[data-attr]')];
+function readAttrs() {
+  const o = {};
+  attrInputs.forEach(i => { const v = i.value.trim(); if (v) o[i.dataset.attr] = v; });
+  return o;
+}
+$('attrClear').onclick = () => { attrInputs.forEach(i => { i.value = ''; }); showParts(null); };
+
 async function search() {
   let a = $('qa').value.trim(), b = $('qb').value.trim(), c = $('qc').value.trim();
   const ocr = $('ocr').value.trim();
-  if (!a && !ocr) return;
+  const attrs = readAttrs();
+  const hasAttr = Object.keys(attrs).some(key => key !== 'neg');   // chi co o Loai tru thi chua tim duoc
+  if (!a && !ocr && !hasAttr) return;
   if ($('vi').checked) {
     $('status').textContent = 'đang dịch…';
     try {
-      [a, b, c] = await Promise.all([a, b, c].map(toEnglish));
+      const keys = Object.keys(attrs);
+      const tr = await Promise.all([a, b, c, ...keys.map(key => attrs[key])].map(toEnglish));
+      [a, b, c] = tr;
+      keys.forEach((key, n) => { attrs[key] = tr[3 + n]; });
       $('qa').value = a; if (b) $('qb').value = b; if (c) $('qc').value = c;  // thay CLIP nhan cau nao
+      attrInputs.forEach(i => { if (attrs[i.dataset.attr]) i.value = attrs[i.dataset.attr]; });
     } catch (e) { $('status').textContent = 'Lỗi dịch: ' + e.message; return; }
   }
   const k = $('k').value, mpv = $('mpv').value;
+  const at = Object.keys(attrs).length ? `&attrs=${encodeURIComponent(JSON.stringify(attrs))}` : '';
   if (mode === 'temporal' && b) {
     lastQuery = {a, b, c};
     const q = `a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}&c=${encodeURIComponent(c)}`;
-    run(`/api/temporal?${q}&window=${$('win').value}&k=${k}&max_per_video=${mpv}${extra()}`,
-        c ? 'A → B → C' : 'A → B');
+    run(`/api/temporal?${q}&window=${$('win').value}&k=${k}&max_per_video=${mpv}${extra()}${at}`,
+        (c ? 'A → B → C' : 'A → B') + (hasAttr ? ' + ô' : ''));
   } else {
     lastQuery = {a, b: '', c: ''};
-    run(`/api/search?q=${encodeURIComponent(a)}&k=${k}&max_per_video=${mpv}${extra()}`, a ? 'Văn bản' : 'Chỉ OCR');
+    run(`/api/search?q=${encodeURIComponent(a)}&k=${k}&max_per_video=${mpv}${extra()}${at}`,
+        a ? 'Văn bản' + (hasAttr ? ' + ô' : '') : (hasAttr ? 'Theo ô' : 'Chỉ OCR'));
   }
 }
 $('go').onclick = search;
-['qa', 'qb', 'qc', 'ocr'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') search(); }));
+[...['qa', 'qb', 'qc', 'ocr'].map($), ...attrInputs].forEach(el =>
+  el.addEventListener('keydown', e => { if (e.key === 'Enter') search(); }));
+
+// O "Ma video": moi keyframe cua 1 video theo thoi gian. Nhan: L24_V025 · l24 v25 · L24_V025 5:30 ·
+// L24_V025 330 (giay) · L24_V025,15690 (frame_idx) · dan nguyen tieu de drawer "L24_V025 · 8:43.0 · #3"
+function parseVid(s) {
+  const m = String(s || '').trim().match(/^L?\s*(\d{1,2})\s*[_\-\s]?\s*V\s*(\d{1,3})(?:\s*([,@])?\s*(\S.*))?$/i);
+  if (!m) return null;
+  const p = {vid: `L${m[1].padStart(2, '0')}_V${m[2].padStart(3, '0')}`};
+  const rest = (m[4] || '').trim();
+  if (rest && m[3] === ',') p.frame = parseInt(rest, 10);
+  else if (rest) {
+    const ms = rest.match(/(\d+):(\d{1,2}(?:\.\d+)?)/), sec = rest.match(/\d+(?:\.\d+)?/);
+    if (ms) p.t = +ms[1] * 60 + +ms[2];
+    else if (sec) p.t = +sec[0];
+  }
+  return p;
+}
+async function browseVideo(p) {
+  if (typeof p === 'string') p = parseVid(p);
+  if (!p) return toast('Mã video chưa đúng, vd: L24_V025 hoặc L24_V025 5:30');
+  $('status').textContent = `đang mở ${p.vid}…`;
+  try {
+    const j = await api(`/api/video_frames?video=${encodeURIComponent(p.vid)}`);
+    results = j.results; lastQuery = {a: '', b: '', c: ''}; render(); showParts(null);
+    const near = f => results.reduce((best, r, i) => (f(r) < f(results[best]) ? i : best), 0);
+    const at = !results.length ? -1 : p.frame != null && !isNaN(p.frame) ? near(r => Math.abs(r.frame_idx - p.frame))
+      : p.t != null ? near(r => Math.abs(r.pts_time - p.t)) : -1;
+    $('status').textContent = `${p.vid}: ${results.length} keyframe theo thời gian (←/→ trong khung chi tiết = lùi/tiến)`;
+    $('vidBox').value = p.vid + (at >= 0 ? ' ' + fmtTime(results[at].pts_time) : '');
+    history.replaceState(null, '', `#v=${p.vid}` + (at >= 0 ? `&t=${results[at].pts_time}` : ''));
+    if (at >= 0) {   // co thoi diem -> mo luon khung chi tiet o dung cho do (anh lon + video tua san)
+      $('grid').children[at].scrollIntoView({block: 'center'});
+      openDrawer(at);
+    }
+  } catch (e) { $('status').textContent = 'Lỗi: ' + e.message; }
+}
+$('vidGo').onclick = () => browseVideo($('vidBox').value);
+$('vidBox').addEventListener('keydown', e => { if (e.key === 'Enter') browseVideo($('vidBox').value); });
+// Link chia se cho dong doi: http://<IP>:<port>/#v=L24_V025&t=523
+function fromHash() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('v')) browseVideo(h.get('v') + (h.get('t') ? ' ' + h.get('t') : ''));
+}
+window.addEventListener('hashchange', fromHash);
+fromHash();
 
 async function searchByFile(file, what) {
   $('status').textContent = `đang tìm bằng ${what}…`; $('go').disabled = true;
@@ -331,6 +447,7 @@ function renderTopVids() {
     all[r.video] = (all[r.video] || 0) + 1;
     if (i < 20) cnt[r.video] = (cnt[r.video] || 0) + 1;
   });
+  if (Object.keys(all).length < 2) { $('topvids').innerHTML = ''; return; }   // dang xem 1 video -> khong can chip
   const ranked = Object.entries(cnt).sort((a, b) => b[1] - a[1]);   // sort on dinh: hoa nhau thi video len hang truoc dung truoc
   $('topvids').innerHTML = ranked.length
     ? '<span class="status">Top 20:</span>' + ranked.map(([v, n], i) =>
@@ -416,7 +533,11 @@ async function openDrawer(i, item) {
     + (r.ocr ? `<span>OCR</span><span>${esc(r.ocr)}</span>` : '')
     + (r.chain ? `<span>chuỗi</span><span>${r.chain.map((e, n) => `${'ABCDE'[n]} ${fmtTime(e.pts_time)} (f ${e.frame_idx})`).join(' → ')}</span>` : '');
   $('dSim').onclick = () => { closeDrawer(); run(`/api/similar/${r.id}?k=${$('k').value}&max_per_video=${$('mpv').value}${extra()}`, `Tương tự ${r.video} @ ${fmtTime(r.pts_time)}`); };
-  $('dCopy').onclick = () => navigator.clipboard.writeText(`${r.video},${r.frame_idx}`).then(() => toast('Đã copy'));
+  $('dVid').onclick = () => { closeDrawer(); browseVideo({vid: r.video, t: r.pts_time}); };
+  $('dCopy').onclick = () => {
+    const s = `${r.video} ${fmtTime(r.pts_time)}`;
+    copyText(s).then(() => toast('Đã copy: ' + s)).catch(e => toast('Không copy được: ' + e.message));
+  };
   $('dGt').onclick = async () => {
     if (!lastQuery.a) return toast('Chưa có câu truy vấn văn bản');
     try {
@@ -433,9 +554,9 @@ async function openDrawer(i, item) {
   // KHONG tu dien mau vao o nua: o con chu thi nut nop cu gui dang text -> task KIS bi DRES tu choi
   // ("non-temporal information"). Gio 2 nut rieng: KIS luon gui video+thoi diem, QA moi gui chu.
 
+  // Nop ngay, khong hoi lai (nop som duoc diem cao hon). Nut bi khoa trong luc nop nen bam dup chi gui 1 lan;
+  // server cung chi cho 1 luot nop moi luc (app.py).
   async function submit(text) {
-    const what = text ? `đáp án "${text}"` : `${r.video} @ frame ${r.frame_idx} (${fmtTime(r.pts_time)})`;
-    if (!confirm(`Nộp lên DRES: ${what}?\nKhông thể hoàn tác.`)) return;
     $('dSubmit').disabled = $('dSubmitQa').disabled = true;
     setVerdict('⏳ đang nộp…', 'var(--muted)');
     try {
